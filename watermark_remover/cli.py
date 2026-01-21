@@ -29,7 +29,11 @@ def setup():
 @click.option("--detection-skip", default=1, type=int, help="Detect watermarks every N frames for videos (1-10). Higher = faster but may miss brief watermarks.")
 @click.option("--fade-in", default=0.0, type=float, help="Extend mask backwards by N seconds to handle fade-in watermarks.")
 @click.option("--fade-out", default=0.0, type=float, help="Extend mask forwards by N seconds to handle fade-out watermarks.")
-def remove_cmd(input_path, output_path, preview, overwrite, transparent, max_bbox_percent, force_format, detection_prompt, detection_skip, fade_in, fade_out):
+@click.option("--preset", type=click.Choice(["veo"], case_sensitive=False), default=None, help="Use predefined watermark coordinates for known services. Bypasses AI detection.")
+@click.option("--coords", default=None, type=str, help="Watermark bbox as JSON: [x1,y1,x2,y2] or [[x1,y1,x2,y2],...]. Bypasses AI detection.")
+@click.option("--coords-file", default=None, type=click.Path(exists=True), help="JSON file with watermark coordinates.")
+@click.option("--coords-percent", default=None, type=str, help="Coordinates as percentages (0-100): [x1,y1,x2,y2] or [[...],...].")
+def remove_cmd(input_path, output_path, preview, overwrite, transparent, max_bbox_percent, force_format, detection_prompt, detection_skip, fade_in, fade_out, preset, coords, coords_file, coords_percent):
     """Remove watermarks from images or videos."""
     from .core import process
 
@@ -45,6 +49,10 @@ def remove_cmd(input_path, output_path, preview, overwrite, transparent, max_bbo
         detection_skip=detection_skip,
         fade_in=fade_in,
         fade_out=fade_out,
+        preset=preset,
+        coords=coords,
+        coords_file=coords_file,
+        coords_percent=coords_percent,
     )
 
 

@@ -30,6 +30,16 @@ except ImportError:
     MatLike = np.ndarray
 
 
+# Predefined watermark coordinates (percentage-based for resolution independence)
+# Format: coords_percent is [[x1%, y1%, x2%, y2%], ...] where values are 0-100
+WATERMARK_PRESETS = {
+    "veo": {
+        "description": "Google Veo watermark (bottom-right corner)",
+        "coords_percent": [[93.5, 93.2, 98.7, 97.4]],
+    },
+}
+
+
 def download_lama_model():
     """Download LaMA model using iopaint."""
     logger.info("Downloading LaMA model... (this may take a few minutes)")
@@ -192,6 +202,147 @@ def is_video_file(file_path):
     """Check if the file is a video based on its extension"""
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm']
     return Path(file_path).suffix.lower() in video_extensions
+
+
+def parse_coords(coords: str = None, coords_file: str = None, coords_percent: str = None,
+                 preset: str = None, width: int = None, height: int = None) -> list:
+    """
+    Parse user-provided watermark coordinates into a list of bboxes.
+
+    Args:
+        coords: JSON string of absolute pixel coordinates
+        coords_file: Path to JSON file with coordinates
+        coords_percent: JSON string of percentage-based coordinates (0-100)
+        preset: Name of a predefined preset (e.g., "veo")
+        width: Video/image width (required for percentage conversion)
+        height: Video/image height (required for percentage conversion)
+
+    Returns:
+        List of bboxes: [[x1, y1, x2, y2], ...]
+    """
+    import json
+
+    bboxes = []
+    percent_coords = None
+
+    if preset:
+        if preset.lower() not in WATERMARK_PRESETS:
+            raise ValueError(f"Unknown preset: {preset}. Available: {list(WATERMARK_PRESETS.keys())}")
+        percent_coords = WATERMARK_PRESETS[preset.lower()]["coords_percent"]
+
+    elif coords:
+        parsed = json.loads(coords)
+        if parsed and isinstance(parsed[0], (int, float)):
+            bboxes = [list(map(int, parsed))]
+        else:
+            bboxes = [list(map(int, b)) for b in parsed]
+
+    elif coords_file:
+        with open(coords_file) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            if data and isinstance(data[0], (int, float)):
+                bboxes = [list(map(int, data))]
+            else:
+                bboxes = [list(map(int, b)) for b in data]
+        elif isinstance(data, dict) and "regions" in data:
+            bboxes = [list(map(int, r["bbox"])) for r in data["regions"]]
+        elif isinstance(data, dict) and "coords_percent" in data:
+            percent_coords = data["coords_percent"]
+
+    elif coords_percent:
+        parsed = json.loads(coords_percent)
+        if parsed and isinstance(parsed[0], (int, float)):
+            percent_coords = [parsed]
+        else:
+            percent_coords = parsed
+
+    if percent_coords:
+        if width is None or height is None:
+            raise ValueError("Width and height required for percentage-based coordinates")
+        for pct in percent_coords:
+            x1 = int(pct[0] / 100 * width)
+            y1 = int(pct[1] / 100 * height)
+            x2 = int(pct[2] / 100 * width)
+            y2 = int(pct[3] / 100 * height)
+            bboxes.append([x1, y1, x2, y2])
+
+    return bboxes
+
+
+def validate_bboxes(bboxes: list, width: int, height: int, max_bbox_percent: float = None) -> list:
+    """
+    Validate and sanitize bounding boxes.
+
+    Args:
+        bboxes: List of [x1, y1, x2, y2] coordinates
+        width: Image/video width
+        height: Image/video height
+        max_bbox_percent: Optional max size check
+
+    Returns:
+        List of validated bboxes
+    """
+    validated = []
+    image_area = width * height
+
+    for bbox in bboxes:
+        if len(bbox) != 4:
+            logger.warning(f"Bbox must have 4 values, got {len(bbox)}: {bbox}")
+            continue
+
+        x1, y1, x2, y2 = map(int, bbox)
+
+        # Ensure proper ordering
+        if x1 > x2:
+            x1, x2 = x2, x1
+        if y1 > y2:
+            y1, y2 = y2, y1
+
+        # Clamp to image bounds
+        x1 = max(0, min(x1, width))
+        x2 = max(0, min(x2, width))
+        y1 = max(0, min(y1, height))
+        y2 = max(0, min(y2, height))
+
+        # Check for zero-area bbox
+        if x1 >= x2 or y1 >= y2:
+            logger.warning(f"Skipping zero-area bbox: {bbox}")
+            continue
+
+        # Optional size check
+        if max_bbox_percent is not None:
+            bbox_area = (x2 - x1) * (y2 - y1)
+            area_pct = (bbox_area / image_area) * 100
+            if area_pct > max_bbox_percent:
+                logger.warning(f"Bbox too large ({area_pct:.1f}% > {max_bbox_percent}%): {bbox}")
+                continue
+
+        validated.append([x1, y1, x2, y2])
+
+    return validated
+
+
+def create_mask_from_bboxes(bboxes: list, width: int, height: int) -> Image.Image:
+    """
+    Create a binary mask from bounding boxes.
+
+    Args:
+        bboxes: List of [x1, y1, x2, y2] coordinates
+        width: Image width
+        height: Image height
+
+    Returns:
+        PIL Image in "L" mode (255=watermark, 0=keep)
+    """
+    mask = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(mask)
+
+    for bbox in bboxes:
+        x1, y1, x2, y2 = bbox
+        draw.rectangle([x1, y1, x2, y2], fill=255)
+
+    return mask
 
 
 def process_video(input_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt="watermark", progress_offset=0, progress_scale=100):
@@ -480,14 +631,17 @@ def process_video_two_pass(input_path, output_path, florence_model, florence_pro
             logger.warning("FFmpeg is not available. Video will be produced without audio.")
             shutil.copy(str(temp_video_path), str(output_file))
         else:
+            # Re-encode with H.264 for better compression (mp4v from OpenCV is bloated)
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
                 "-i", str(temp_video_path),
                 "-i", str(input_path),
-                "-c:v", "copy",
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "18",  # High quality (lower = better, 18-23 is visually lossless)
                 "-c:a", "aac",
                 "-map", "0:v:0",
-                "-map", "1:a:0",
+                "-map", "1:a:0?",  # ? makes audio optional
                 "-shortest",
                 str(output_file)
             ]
@@ -497,6 +651,212 @@ def process_video_two_pass(input_path, output_path, florence_model, florence_pro
         logger.error(f"Error during audio/video merge: {str(e)}")
         shutil.copy(str(temp_video_path), str(output_file))
     finally:
+        try:
+            os.remove(str(temp_video_path))
+            os.rmdir(temp_dir)
+        except:
+            pass
+
+    final_progress = progress_offset + progress_scale
+    logger.info(f"input_path:{input_path}, output_path:{output_file}, overall_progress:{final_progress}")
+    return output_file
+
+
+def process_video_fixed_coords(input_path, output_path, bboxes, model_manager, transparent=False, force_format=None, progress_offset=0, progress_scale=100):
+    """
+    Process video with fixed watermark coordinates (no AI detection).
+
+    This is the most efficient mode for videos with static watermarks:
+    - Creates mask ONCE from provided coordinates
+    - Applies identical mask to ALL frames
+    - No Florence-2 model needed
+    - Pipes raw frames directly to FFmpeg (single H.264 encode, no intermediate file)
+
+    Args:
+        input_path: Input video path
+        output_path: Output video/directory path
+        bboxes: List of [x1,y1,x2,y2] watermark coordinates (already validated)
+        model_manager: LaMA model (can be None if transparent=True)
+        transparent: Replace watermark with white (transparency not supported in video)
+        force_format: Output format (MP4, AVI)
+        progress_offset: Starting progress percentage
+        progress_scale: Progress range for this operation
+
+    Returns:
+        Path to output video file
+    """
+    input_path = Path(input_path)
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        logger.error(f"Error opening video file: {input_path}")
+        return None
+
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    logger.info(f"Processing video (fixed coords): {width}x{height}, {fps:.2f}fps, {total_frames} frames")
+    logger.info(f"Watermark regions: {len(bboxes)} bbox(es)")
+
+    # CREATE MASK ONCE - this is the key optimization
+    mask = create_mask_from_bboxes(bboxes, width, height)
+    mask_array = np.array(mask)
+
+    logger.info(f"Created static mask covering {np.sum(mask_array > 0)} pixels")
+
+    # Determine output format
+    if force_format:
+        output_format = force_format.upper()
+    else:
+        output_format = "MP4"
+
+    # Create output video file
+    output_path = Path(output_path)
+    if output_path.is_dir():
+        output_file = output_path / f"{input_path.stem}_no_watermark.{output_format.lower()}"
+    else:
+        output_file = output_path.with_suffix(f".{output_format.lower()}")
+
+    # Check if FFmpeg is available for direct piping
+    ffmpeg_available = False
+    try:
+        subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT)
+        ffmpeg_available = True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        logger.warning("FFmpeg not available. Falling back to OpenCV (lower quality, no audio).")
+
+    if ffmpeg_available:
+        # Direct pipe to FFmpeg - single encode, best quality
+        logger.info("Using FFmpeg pipe for direct H.264 encoding (single encode, best quality)")
+
+        # FFmpeg command to read raw video frames from stdin and encode with H.264
+        # Also copies audio from original file
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            # Input 1: raw video frames from pipe
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}",
+            "-r", str(fps),
+            "-i", "-",  # stdin
+            # Input 2: original file for audio
+            "-i", str(input_path),
+            # Video encoding
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            # Audio (copy from original)
+            "-c:a", "aac",
+            "-map", "0:v:0",
+            "-map", "1:a:0?",
+            "-shortest",
+            str(output_file)
+        ]
+
+        # Start FFmpeg process
+        # Note: stderr must go to DEVNULL to prevent buffer deadlock
+        # (FFmpeg writes lots of progress info to stderr which fills the pipe buffer)
+        ffmpeg_proc = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+        # Process all frames with the SAME mask
+        with tqdm.tqdm(total=total_frames, desc="Processing frames (fixed coords)") as pbar:
+            frame_count = 0
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # Convert frame to PIL Image (BGR -> RGB)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(frame_rgb)
+
+                # Apply inpainting or transparency
+                if transparent:
+                    result_image = make_region_transparent(pil_image, mask)
+                    background = Image.new("RGB", result_image.size, (255, 255, 255))
+                    background.paste(result_image, mask=result_image.split()[3])
+                    result_image = background
+                else:
+                    lama_result = process_image_with_lama(np.array(pil_image), mask_array, model_manager)
+                    result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
+
+                # Convert back to BGR and write to FFmpeg stdin
+                frame_result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
+                ffmpeg_proc.stdin.write(frame_result.tobytes())
+
+                # Update progress
+                frame_count += 1
+                pbar.update(1)
+                local_progress = frame_count / total_frames
+                progress = int(progress_offset + local_progress * progress_scale)
+                print(f"Processing frame {frame_count}/{total_frames}, overall_progress:{progress}%")
+
+        # Close FFmpeg stdin and wait for completion
+        cap.release()
+        ffmpeg_proc.stdin.close()
+        ffmpeg_proc.wait()
+
+        if ffmpeg_proc.returncode != 0:
+            logger.error(f"FFmpeg encoding failed with return code {ffmpeg_proc.returncode}")
+            return None
+
+        logger.info("Video encoding completed successfully!")
+
+    else:
+        # Fallback: use OpenCV VideoWriter (lower quality, no audio)
+        temp_dir = tempfile.mkdtemp()
+        temp_video_path = Path(temp_dir) / f"temp_no_audio.{output_format.lower()}"
+
+        if output_format.upper() == "MP4":
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        elif output_format.upper() == "AVI":
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        else:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+
+        out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (width, height))
+
+        with tqdm.tqdm(total=total_frames, desc="Processing frames (fixed coords)") as pbar:
+            frame_count = 0
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(frame_rgb)
+
+                if transparent:
+                    result_image = make_region_transparent(pil_image, mask)
+                    background = Image.new("RGB", result_image.size, (255, 255, 255))
+                    background.paste(result_image, mask=result_image.split()[3])
+                    result_image = background
+                else:
+                    lama_result = process_image_with_lama(np.array(pil_image), mask_array, model_manager)
+                    result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
+
+                frame_result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
+                out.write(frame_result)
+
+                frame_count += 1
+                pbar.update(1)
+                local_progress = frame_count / total_frames
+                progress = int(progress_offset + local_progress * progress_scale)
+                print(f"Processing frame {frame_count}/{total_frames}, overall_progress:{progress}%")
+
+        cap.release()
+        out.release()
+        shutil.copy(str(temp_video_path), str(output_file))
+
         try:
             os.remove(str(temp_video_path))
             os.rmdir(temp_dir)
@@ -564,7 +924,7 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
     return new_output_path
 
 
-def process(input_path: str, output_path: str, preview: bool = False, overwrite: bool = False, transparent: bool = False, max_bbox_percent: float = 10.0, force_format: str = None, detection_prompt: str = "watermark", detection_skip: int = 1, fade_in: float = 0.0, fade_out: float = 0.0):
+def process(input_path: str, output_path: str, preview: bool = False, overwrite: bool = False, transparent: bool = False, max_bbox_percent: float = 10.0, force_format: str = None, detection_prompt: str = "watermark", detection_skip: int = 1, fade_in: float = 0.0, fade_out: float = 0.0, preset: str = None, coords: str = None, coords_file: str = None, coords_percent: str = None):
     """Main processing function - called by CLI."""
     # Input validation
     if detection_skip < 1 or detection_skip > 10:
@@ -576,6 +936,184 @@ def process(input_path: str, output_path: str, preview: bool = False, overwrite:
         fade_out = 0
 
     input_path = Path(input_path)
+
+    # Check if using fixed coordinates mode
+    use_fixed_coords = bool(preset or coords or coords_file or coords_percent)
+
+    # Validate mutually exclusive options
+    coord_options = [preset, coords, coords_file, coords_percent]
+    if sum(1 for opt in coord_options if opt) > 1:
+        logger.error("Cannot use multiple coordinate options together. Choose one of: --preset, --coords, --coords-file, --coords-percent")
+        return
+
+    if use_fixed_coords and preview:
+        logger.error("Preview mode is not supported with fixed coordinates")
+        return
+
+    # ========== FIXED COORDINATES MODE ==========
+    if use_fixed_coords:
+        logger.info("Using fixed coordinates mode (no AI detection)")
+        output_path = Path(output_path)
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {device}")
+
+        # Only load LaMA if not transparent mode
+        if not transparent:
+            model_manager = load_lama_model(device)
+            logger.info("LaMa model loaded")
+        else:
+            model_manager = None
+
+        # Handle single file
+        if not input_path.is_dir():
+            # Get dimensions for coordinate parsing
+            if is_video_file(input_path):
+                cap = cv2.VideoCapture(str(input_path))
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                cap.release()
+            else:
+                img = Image.open(input_path)
+                width, height = img.size
+                img.close()
+
+            # Parse and validate coordinates
+            try:
+                bboxes = parse_coords(coords, coords_file, coords_percent, preset, width, height)
+            except Exception as e:
+                logger.error(f"Failed to parse coordinates: {e}")
+                return
+
+            bboxes = validate_bboxes(bboxes, width, height, max_bbox_percent)
+            if not bboxes:
+                logger.error("No valid coordinates provided")
+                return
+
+            logger.info(f"Using {len(bboxes)} watermark region(s): {bboxes}")
+
+            # Ensure output path
+            if output_path.is_dir():
+                output_file = output_path / input_path.name
+            else:
+                output_file = output_path
+
+            # SAFETY: Never overwrite the input file
+            if input_path.resolve() == output_file.resolve():
+                logger.error(f"Cannot overwrite input file: {input_path}. Choose a different output path.")
+                return
+
+            if output_file.exists() and not overwrite:
+                logger.info(f"Skipping existing file: {output_file}")
+                return
+
+            if is_video_file(input_path):
+                # Ensure video output has proper extension
+                if output_file.suffix.lower() not in ['.mp4', '.avi', '.mov', '.mkv']:
+                    if force_format and force_format.upper() in ["MP4", "AVI"]:
+                        output_file = output_file.with_suffix(f".{force_format.lower()}")
+                    else:
+                        output_file = output_file.with_suffix(".mp4")
+                process_video_fixed_coords(input_path, output_file, bboxes, model_manager, transparent, force_format)
+            else:
+                # Process image with fixed coords
+                image = Image.open(input_path).convert("RGB")
+                mask = create_mask_from_bboxes(bboxes, width, height)
+
+                if transparent:
+                    result_image = make_region_transparent(image, mask)
+                else:
+                    lama_result = process_image_with_lama(np.array(image), np.array(mask), model_manager)
+                    result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
+
+                # Determine output format
+                if force_format:
+                    output_format = force_format.upper()
+                elif transparent:
+                    output_format = "PNG"
+                else:
+                    output_format = input_path.suffix[1:].upper()
+                    if output_format not in ["PNG", "WEBP", "JPG"]:
+                        output_format = "PNG"
+
+                if output_format == "JPG":
+                    output_format = "JPEG"
+
+                output_file = output_file.with_suffix(f".{output_format.lower()}")
+                result_image.save(output_file, format=output_format)
+
+            print(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")
+            return
+
+        # Handle directory with fixed coords
+        if not output_path.exists():
+            output_path.mkdir(parents=True)
+
+        images = list(input_path.glob("*.[jp][pn]g")) + list(input_path.glob("*.webp"))
+        videos = list(input_path.glob("*.mp4")) + list(input_path.glob("*.avi")) + list(input_path.glob("*.mov")) + list(input_path.glob("*.mkv"))
+        files = images + videos
+        total_files = len(files)
+
+        for idx, file_path in enumerate(tqdm.tqdm(files, desc="Processing files (fixed coords)")):
+            output_file = output_path / file_path.name
+
+            # Get dimensions for this file
+            if is_video_file(file_path):
+                cap = cv2.VideoCapture(str(file_path))
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                cap.release()
+            else:
+                img = Image.open(file_path)
+                width, height = img.size
+                img.close()
+
+            # Parse and validate coordinates for this file's dimensions
+            try:
+                bboxes = parse_coords(coords, coords_file, coords_percent, preset, width, height)
+            except Exception as e:
+                logger.warning(f"Failed to parse coordinates for {file_path}: {e}")
+                continue
+
+            bboxes = validate_bboxes(bboxes, width, height, max_bbox_percent)
+            if not bboxes:
+                logger.warning(f"No valid coordinates for {file_path}, skipping")
+                continue
+
+            progress_offset = int(idx / total_files * 100)
+            progress_scale = int(100 / total_files)
+
+            if is_video_file(file_path):
+                if output_file.suffix.lower() not in ['.mp4', '.avi']:
+                    output_file = output_file.with_suffix(".mp4")
+                process_video_fixed_coords(file_path, output_file, bboxes, model_manager, transparent, force_format, progress_offset, progress_scale)
+            else:
+                image = Image.open(file_path).convert("RGB")
+                mask = create_mask_from_bboxes(bboxes, width, height)
+
+                if transparent:
+                    result_image = make_region_transparent(image, mask)
+                else:
+                    lama_result = process_image_with_lama(np.array(image), np.array(mask), model_manager)
+                    result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
+
+                if force_format:
+                    output_format = force_format.upper()
+                elif transparent:
+                    output_format = "PNG"
+                else:
+                    output_format = file_path.suffix[1:].upper()
+                    if output_format not in ["PNG", "WEBP", "JPG"]:
+                        output_format = "PNG"
+
+                if output_format == "JPG":
+                    output_format = "JPEG"
+
+                output_file = output_file.with_suffix(f".{output_format.lower()}")
+                result_image.save(output_file, format=output_format)
+                print(f"input_path:{file_path}, output_path:{output_file}, overall_progress:{progress_offset + progress_scale}%")
+
+        return
 
     # ========== PREVIEW MODE ==========
     if preview:

@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cuda = []  # triggers pytorch-cuda index for torch
+cuda = ["torch>=2.4.0"]  # CUDA-enabled PyTorch from pytorch-cuda index
 
 [project.scripts]
 watermark-remover = "watermark_remover.cli:main"
@@ -47,12 +47,9 @@ packages = ["watermark_remover"]
 
 [tool.uv]
 
-# PyTorch source selection: cuda extra overrides default CPU
+# PyTorch source: use CUDA index when cuda extra is specified
 [tool.uv.sources]
-torch = [
-    { index = "pytorch-cuda", extra = "cuda" },
-    { index = "pytorch-cpu" },
-]
+torch = { index = "pytorch-cuda", extra = "cuda" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
@@ -64,7 +61,7 @@ name = "pytorch-cuda"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
-# Override iopaint's dependencies - only include what we actually need
+# Override iopaint's dependencies - include what we need for LaMA
 [[tool.uv.dependency-metadata]]
 name = "iopaint"
 requires-dist = [
@@ -74,6 +71,10 @@ requires-dist = [
     "omegaconf",
     "easydict",
     "yacs",
+    "diffusers",
+    "safetensors",
+    "piexif",
+    "imghdr-lts; python_version >= '3.13'",  # backport for Python 3.13+
 ]
 
 # =============================================================================

@@ -23,7 +23,9 @@ https://github.com/user-attachments/assets/505be2a8-8eda-4def-90b6-5a4ceefee456
 - **Smart Detection** - AI-powered watermark detection using Florence-2
 - **Seamless Removal** - LaMA inpainting for natural-looking results
 - **Video Support** - Process videos with two-pass detection and audio preservation
-- **AI Video Ready** - Remove watermarks from Sora, Sora 2, Runway, and other AI-generated videos
+- **AI Video Ready** - Remove watermarks from Sora, Sora 2, Runway, Veo, and other AI-generated videos
+- **Fixed Coordinates Mode** - Skip AI detection with user-provided watermark positions
+- **Presets** - Built-in presets for known watermarks (e.g., Veo)
 - **Batch Processing** - Handle entire folders at once
 - **Preview Mode** - Preview detected watermarks before processing
 - **Fade In/Out Handling** - Extend masks for watermarks that fade in/out
@@ -70,7 +72,7 @@ Install FFmpeg to preserve audio when processing videos:
 ## Usage
 
 ```bash
-# Basic usage
+# Basic usage (AI detection)
 watermark-remover remove input.png output_folder/
 
 # With options
@@ -83,10 +85,74 @@ watermark-remover remove video.mp4 ./output --detection-skip=3 --fade-in=0.5 --f
 watermark-remover remove input.png --preview
 ```
 
+### Fixed Coordinates Mode
+
+Skip AI detection entirely by providing watermark coordinates directly. This is faster and more reliable when you know the exact watermark position.
+
+```bash
+# Use a preset (e.g., Veo watermark)
+watermark-remover remove video.mp4 output.mp4 --preset veo
+
+# Provide pixel coordinates (single region)
+watermark-remover remove video.mp4 output.mp4 --coords "[100, 50, 300, 100]"
+
+# Multiple regions
+watermark-remover remove video.mp4 output.mp4 --coords "[[100,50,300,100], [10,800,150,850]]"
+
+# Percentage-based coordinates (works across resolutions)
+watermark-remover remove video.mp4 output.mp4 --coords-percent "[80, 90, 100, 100]"
+
+# Load coordinates from JSON file
+watermark-remover remove video.mp4 output.mp4 --coords-file coords.json
+```
+
+Coordinates format: `[x1, y1, x2, y2]` where (x1, y1) is top-left and (x2, y2) is bottom-right.
+
+```
+(0,0) ────────────────────────► X (width)
+  │
+  │     (x1, y1) ┌─────────┐
+  │              │WATERMARK│
+  │              └─────────┘ (x2, y2)
+  ▼
+  Y (height)
+```
+
+### Finding Watermark Coordinates
+
+**Option 1: Use Preview Mode**
+
+Let the AI detect the watermark and show you the coordinates:
+
+```bash
+watermark-remover remove video.mp4 --preview
+```
+
+This outputs JSON with detected bboxes you can copy to `--coords`.
+
+**Option 2: Use an Image Editor**
+
+1. Take a screenshot of a frame with the watermark
+2. Open in any image editor (Paint, GIMP, Photoshop)
+3. Note the cursor position (shown in status bar) at top-left and bottom-right corners
+
+**Option 3: Common Percentage Positions**
+
+| Position            | `--coords-percent`      |
+| ------------------- | ----------------------- |
+| Bottom-right corner | `[85, 90, 100, 100]`    |
+| Bottom-left corner  | `[0, 90, 15, 100]`      |
+| Top-right corner    | `[85, 0, 100, 10]`      |
+| Center bottom       | `[40, 90, 60, 100]`     |
+
 ### Options
 
 | Option               | Description                                                 |
 | -------------------- | ----------------------------------------------------------- |
+| `--preset`           | Use predefined coordinates (e.g., `veo`). Bypasses AI.      |
+| `--coords`           | Watermark bbox as JSON. Bypasses AI detection.              |
+| `--coords-percent`   | Coordinates as percentages (0-100). Bypasses AI detection.  |
+| `--coords-file`      | JSON file with coordinates. Bypasses AI detection.          |
 | `--overwrite`        | Overwrite existing files                                    |
 | `--transparent`      | Make watermark regions transparent (images only)            |
 | `--max-bbox-percent` | Max detection size as % of image (default: 10)              |
@@ -104,6 +170,7 @@ watermark-remover remove input.png --preview
 - **Supported formats:** MP4, AVI, MOV, MKV, FLV, WMV, WEBM
 - **Audio preservation:** Requires FFmpeg installed
 - **Two-pass mode:** Faster processing with `--detection-skip` > 1
+- **Fixed coordinates mode:** Fastest option when watermark position is known
 - **Fade handling:** Use `--fade-in` / `--fade-out` for watermarks that appear/disappear gradually
 
 ---
