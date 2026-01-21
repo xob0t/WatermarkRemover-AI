@@ -24,14 +24,8 @@ dependencies = [
     "psutil",
     "pyyaml",
 
-    # iopaint (LaMA inpainting) - deps manually specified below to avoid heavy deps
+    # iopaint (LaMA inpainting) - deps overridden below
     "iopaint",
-    "pydantic",
-    "typer",
-    "einops",
-    "omegaconf",
-    "easydict",
-    "yacs",
 
     # Hugging Face for model downloads
     "huggingface-hub",
@@ -53,10 +47,17 @@ packages = ["watermark_remover"]
 
 [tool.uv]
 
-# Override iopaint's dependencies to avoid pulling in heavy/conflicting packages
+# Override iopaint's dependencies - only include what we actually need
 [[tool.uv.dependency-metadata]]
 name = "iopaint"
-requires-dist = []
+requires-dist = [
+    "pydantic",
+    "typer",
+    "einops",
+    "omegaconf",
+    "easydict",
+    "yacs",
+]
 
 # =============================================================================
 # RUFF CONFIGURATION
