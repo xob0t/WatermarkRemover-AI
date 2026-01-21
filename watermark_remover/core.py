@@ -204,6 +204,20 @@ def is_video_file(file_path):
     return Path(file_path).suffix.lower() in video_extensions
 
 
+def has_audio_stream(file_path):
+    """Check if a video file has an audio stream using ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(file_path)],
+            capture_output=True,
+            text=True
+        )
+        return "audio" in result.stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        # ffprobe not available, assume audio exists to be safe
+        return True
+
+
 def parse_coords(coords: str = None, coords_file: str = None, coords_percent: str = None,
                  preset: str = None, width: int = None, height: int = None) -> list:
     """
@@ -427,36 +441,38 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
     cap.release()
     out.release()
 
-    # Combine processed video with original audio using FFmpeg
+    # Combine processed video with original audio using FFmpeg (if audio exists)
     try:
-        logger.info("Merging processed video with original audio...")
-
         # Check if FFmpeg is available
         try:
             subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT)
+            ffmpeg_available = True
         except (subprocess.SubprocessError, FileNotFoundError):
-            logger.warning("FFmpeg is not available. Video will be produced without audio.")
+            ffmpeg_available = False
+
+        if not ffmpeg_available:
+            logger.warning("FFmpeg not available. Video will be produced without audio.")
+            shutil.copy(str(temp_video_path), str(output_file))
+        elif not has_audio_stream(input_path):
+            logger.info("Original video has no audio. Copying video only.")
             shutil.copy(str(temp_video_path), str(output_file))
         else:
-            # Use FFmpeg to combine processed video with original audio
+            logger.info("Merging processed video with original audio...")
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
-                "-i", str(temp_video_path),  # Processed video without audio
-                "-i", str(input_path),       # Original video with audio
-                "-c:v", "copy",              # Copy video without re-encoding
-                "-c:a", "aac",               # Encode audio as AAC for better compatibility
-                "-map", "0:v:0",             # Use video track from first file (processed video)
-                "-map", "1:a:0",             # Use audio track from second file (original video)
-                "-shortest",                  # End when the shortest track ends
+                "-i", str(temp_video_path),
+                "-i", str(input_path),
+                "-c:v", "copy",
+                "-c:a", "copy",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-shortest",
                 str(output_file)
             ]
-
-            # Execute FFmpeg
-            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
             logger.info("Audio/video merge completed successfully!")
     except Exception as e:
         logger.error(f"Error during audio/video merge: {str(e)}")
-        # In case of error, use video without audio
         shutil.copy(str(temp_video_path), str(output_file))
     finally:
         # Clean up temporary files
@@ -622,28 +638,34 @@ def process_video_two_pass(input_path, output_path, florence_model, florence_pro
     cap.release()
     out.release()
 
-    # ========== MERGE WITH AUDIO ==========
+    # ========== MERGE WITH AUDIO (if exists) ==========
     try:
-        logger.info("Merging processed video with original audio...")
         try:
             subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT)
+            ffmpeg_available = True
         except (subprocess.SubprocessError, FileNotFoundError):
-            logger.warning("FFmpeg is not available. Video will be produced without audio.")
+            ffmpeg_available = False
+
+        if not ffmpeg_available:
+            logger.warning("FFmpeg not available. Video will be produced without audio.")
+            shutil.copy(str(temp_video_path), str(output_file))
+        elif not has_audio_stream(input_path):
+            logger.info("Original video has no audio. Copying video only.")
             shutil.copy(str(temp_video_path), str(output_file))
         else:
-            # Copy streams without re-encoding
+            logger.info("Merging processed video with original audio...")
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
                 "-i", str(temp_video_path),
                 "-i", str(input_path),
-                "-c:v", "copy",  # Copy video stream (already encoded by OpenCV)
-                "-c:a", "copy",  # Copy audio stream from original
+                "-c:v", "copy",
+                "-c:a", "copy",
                 "-map", "0:v:0",
-                "-map", "1:a:0?",  # ? makes audio optional
+                "-map", "1:a:0",
                 "-shortest",
                 str(output_file)
             ]
-            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
             logger.info("Audio/video merge completed successfully!")
     except Exception as e:
         logger.error(f"Error during audio/video merge: {str(e)}")
@@ -729,31 +751,34 @@ def process_video_fixed_coords(input_path, output_path, bboxes, model_manager, t
         # Direct pipe to FFmpeg - single encode, best quality
         logger.info("Using FFmpeg pipe for direct H.264 encoding (single encode, best quality)")
 
+        # Check if original has audio to include in output
+        has_audio = has_audio_stream(input_path)
+        if has_audio:
+            logger.info("Original has audio - will copy to output")
+        else:
+            logger.info("Original has no audio - video only output")
+
         # FFmpeg command to read raw video frames from stdin and encode with H.264
-        # Also copies audio from original file
         ffmpeg_cmd = [
             "ffmpeg", "-y",
-            # Input 1: raw video frames from pipe
             "-f", "rawvideo",
             "-vcodec", "rawvideo",
             "-pix_fmt", "bgr24",
             "-s", f"{width}x{height}",
             "-r", str(fps),
-            "-i", "-",  # stdin
-            # Input 2: original file for audio
-            "-i", str(input_path),
-            # Video encoding (must encode - receiving raw frames)
+            "-i", "-",
+        ]
+        if has_audio:
+            ffmpeg_cmd.extend(["-i", str(input_path)])
+        ffmpeg_cmd.extend([
             "-c:v", "libx264",
             "-preset", "medium",
             "-crf", "18",
             "-pix_fmt", "yuv420p",
-            # Audio (copy from original without re-encoding)
-            "-c:a", "copy",
-            "-map", "0:v:0",
-            "-map", "1:a:0?",
-            "-shortest",
-            str(output_file)
-        ]
+        ])
+        if has_audio:
+            ffmpeg_cmd.extend(["-c:a", "copy", "-map", "0:v:0", "-map", "1:a:0", "-shortest"])
+        ffmpeg_cmd.append(str(output_file))
 
         # Start FFmpeg process
         # Note: stderr must go to DEVNULL to prevent buffer deadlock
