@@ -2,21 +2,15 @@
 
 **AI-Powered Watermark Removal Tool using Florence-2 and LaMA Models**
 
-🇬🇧 English | 🇫🇷 Français | 🇨🇳 中文 | 🇯🇵 日本語 | 🇧🇷 Português | 🧠 Brainrot
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 ---
 
 ## Overview
 
-`WatermarkRemover-AI` is a cutting-edge application that leverages AI models for precise watermark detection and seamless removal. Perfect for removing watermarks from AI-generated videos like Sora, Sora 2, Runway, and others.
+`WatermarkRemover-AI` is a CLI tool that leverages AI models for precise watermark detection and seamless removal. Perfect for removing watermarks from AI-generated videos like Sora, Sora 2, Runway, and others.
 
-It uses Florence-2 from Microsoft for watermark identification and LaMA for inpainting to fill in the removed regions naturally. The software features a modern GUI built with PyWebview for an accessible and intuitive experience.
-
-## Screenshot
-
-![App Screenshot](assets/screenshot-preview.png)
+It uses Florence-2 from Microsoft for watermark identification and LaMA for inpainting to fill in the removed regions naturally.
 
 ## Demo
 
@@ -34,8 +28,6 @@ https://github.com/user-attachments/assets/505be2a8-8eda-4def-90b6-5a4ceefee456
 - **Preview Mode** - Preview detected watermarks before processing
 - **Fade In/Out Handling** - Extend masks for watermarks that fade in/out
 - **GPU Acceleration** - CUDA support for faster processing
-- **Multi-Language UI** - Available in English, French, Chinese, Japanese, Portuguese, and more
-- **Themes** - Multiple UI themes to choose from
 
 ---
 
@@ -62,8 +54,6 @@ watermark-remover setup
 
 The setup command downloads AI models (~1.7GB total). Dependencies are installed automatically by uv.
 
-After setup, launch with `watermark-remover gui`.
-
 ### Optional: FFmpeg
 
 Install FFmpeg to preserve audio when processing videos:
@@ -75,19 +65,6 @@ Install FFmpeg to preserve audio when processing videos:
 ---
 
 ## Usage
-
-### GUI Mode
-
-1. Run the app with `watermark-remover gui`
-2. Select your preferred language and theme from the top-right corner
-3. Select your mode (Single File or Batch)
-4. Set input and output paths
-5. Configure settings as needed
-6. Hit **Start Processing**
-
-Your settings are automatically saved and restored on next launch.
-
-### CLI Mode
 
 ```bash
 # Basic usage
@@ -104,12 +81,9 @@ watermark-remover remove input.png --preview
 
 # Run setup wizard
 watermark-remover setup
-
-# Launch GUI directly
-watermark-remover gui
 ```
 
-### CLI Options
+### Options
 
 | Option               | Description                                                 |
 | -------------------- | ----------------------------------------------------------- |
@@ -138,8 +112,6 @@ watermark-remover gui
 
 - **Florence-2** - Microsoft's vision model for watermark detection
 - **LaMA** - Large Mask Inpainting model
-- **PyWebview** - Cross-platform webview wrapper
-- **Alpine.js** - Lightweight JavaScript framework for UI
 - **PyTorch** - Deep learning backend
 
 ---

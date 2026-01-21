@@ -17,14 +17,6 @@ def setup():
     run_setup()
 
 
-@main.command()
-def gui():
-    """Launch the graphical user interface."""
-    from .gui import main as gui_main
-
-    gui_main()
-
-
 @main.command("remove")
 @click.argument("input_path", type=click.Path(exists=True))
 @click.argument("output_path", type=click.Path(), required=False, default=None)

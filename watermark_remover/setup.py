@@ -294,7 +294,7 @@ def run_setup():
 
     print_header("Setup complete! Ready to go!")
 
-    print(f"  To run the app: {Colors.WHITE}watermark-remover gui{Colors.RESET}")
+    print(f"  To run the app: {Colors.WHITE}watermark-remover remove <input>{Colors.RESET}")
     print()
     print(f"  {Colors.MAGENTA}Have fun yeeting watermarks!{Colors.RESET}")
     print()
