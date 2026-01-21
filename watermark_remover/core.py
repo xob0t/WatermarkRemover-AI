@@ -1,5 +1,8 @@
 """Core watermark removal functionality."""
 
+from __future__ import annotations
+
+import json
 import os
 import shutil
 import subprocess
@@ -7,32 +10,61 @@ import sys
 import tempfile
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import cv2
+
+# Monkey-patch: cached_download was removed in huggingface_hub 0.24, add compatibility shim
+import huggingface_hub
 import numpy as np
 import tqdm
 from loguru import logger
 from PIL import Image, ImageDraw
 
-# Monkey-patch: cached_download was removed in huggingface_hub 0.24, add compatibility shim
-import huggingface_hub
-if not hasattr(huggingface_hub, 'cached_download'):
+if not hasattr(huggingface_hub, "cached_download"):
     huggingface_hub.cached_download = huggingface_hub.hf_hub_download
 
 import torch
 from iopaint.model_manager import ModelManager
-from iopaint.schema import HDStrategy, InpaintRequest as Config, LDMSampler
+from iopaint.schema import HDStrategy, LDMSampler
+from iopaint.schema import InpaintRequest as Config
 from transformers import AutoProcessor, Florence2ForConditionalGeneration
 
-try:
-    from cv2.typing import MatLike
-except ImportError:
-    MatLike = np.ndarray
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+
+
+# Type definitions
+class DetectionResult(TypedDict):
+    """Result from watermark detection."""
+
+    bbox: list[int]
+    area_percent: float
+    accepted: bool
+
+
+class WatermarkPreset(TypedDict):
+    """Predefined watermark coordinates."""
+
+    description: str
+    coords_percent: list[list[float]]
+
+
+class PreviewResult(TypedDict):
+    """Result from preview mode."""
+
+    image: str
+    detections: list[DetectionResult]
+    source: str
+    source_type: str
+    source_frame: int | None
+    prompt_used: str
+    max_bbox_percent: float
 
 
 # Predefined watermark coordinates (percentage-based for resolution independence)
 # Format: coords_percent is [[x1%, y1%, x2%, y2%], ...] where values are 0-100
-WATERMARK_PRESETS = {
+WATERMARK_PRESETS: dict[str, WatermarkPreset] = {
     "veo": {
         "description": "Google Veo watermark (bottom-right corner)",
         "coords_percent": [[93.5, 93.2, 98.7, 97.4]],
@@ -40,7 +72,7 @@ WATERMARK_PRESETS = {
 }
 
 
-def download_lama_model():
+def download_lama_model() -> bool:
     """Download LaMA model using iopaint."""
     logger.info("Downloading LaMA model... (this may take a few minutes)")
     print("Downloading LaMA model (~196MB)... Please wait.")
@@ -48,7 +80,7 @@ def download_lama_model():
     result = subprocess.run(
         [sys.executable, "-m", "iopaint", "download", "--model", "lama"],
         capture_output=False,  # Show download progress
-        text=True
+        text=True,
     )
 
     if result.returncode != 0:
@@ -60,7 +92,7 @@ def download_lama_model():
     return True
 
 
-def load_lama_model(device):
+def load_lama_model(device: torch.device | str) -> ModelManager:
     """Load LaMA model, downloading if necessary."""
     try:
         return ModelManager(name="lama", device=device)
@@ -70,21 +102,35 @@ def load_lama_model(device):
             if download_lama_model():
                 # Re-import to refresh model registry
                 import importlib
+
                 import iopaint.model
+
                 importlib.reload(iopaint.model)
                 # Try again
                 return ModelManager(name="lama", device=device)
             else:
-                raise RuntimeError("Failed to download LaMA model. Please run manually: python -m iopaint download --model lama")
+                raise RuntimeError(
+                    "Failed to download LaMA model. Please run manually: python -m iopaint download --model lama"
+                ) from e
         raise
 
 
 class TaskType(str, Enum):
+    """Supported Florence-2 task types."""
+
     OPEN_VOCAB_DETECTION = "<OPEN_VOCABULARY_DETECTION>"
-    """Detect bounding box for objects and OCR text"""
+    """Detect bounding box for objects and OCR text."""
 
 
-def identify(task_prompt: TaskType, image: MatLike, text_input: str, model: Florence2ForConditionalGeneration, processor: AutoProcessor, device: str):
+def identify(
+    task_prompt: TaskType,
+    image: Image.Image,
+    text_input: str | None,
+    model: Florence2ForConditionalGeneration,
+    processor: AutoProcessor,
+    device: str,
+) -> dict[str, Any]:
+    """Run Florence-2 inference for object detection."""
     if not isinstance(task_prompt, TaskType):
         raise ValueError(f"task_prompt must be a TaskType, but {task_prompt} is of type {type(task_prompt)}")
 
@@ -105,17 +151,26 @@ def identify(task_prompt: TaskType, image: MatLike, text_input: str, model: Flor
     )
 
 
-def get_watermark_mask(image: MatLike, model: Florence2ForConditionalGeneration, processor: AutoProcessor, device: str, max_bbox_percent: float, detection_prompt: str = "watermark"):
-    """
-    Detect watermarks and create a mask for inpainting.
+def get_watermark_mask(
+    image: Image.Image,
+    model: Florence2ForConditionalGeneration,
+    processor: AutoProcessor,
+    device: str,
+    max_bbox_percent: float,
+    detection_prompt: str = "watermark",
+) -> Image.Image:
+    """Detect watermarks and create a mask for inpainting.
 
     Args:
-        image: PIL Image
-        model: Florence-2 model
+        image: PIL Image to analyze
+        model: Florence-2 model for detection
         processor: Florence-2 processor
-        device: cuda or cpu
-        max_bbox_percent: Maximum bbox size as percentage of image
-        detection_prompt: Text prompt for detection (e.g. "watermark", "watermark Sora logo", "Getty Images")
+        device: Device to run inference on (cuda or cpu)
+        max_bbox_percent: Maximum bbox size as percentage of image area
+        detection_prompt: Text prompt for detection
+
+    Returns:
+        Grayscale mask image (255=watermark region, 0=keep)
     """
     task_prompt = TaskType.OPEN_VOCAB_DETECTION
     parsed_answer = identify(task_prompt, image, detection_prompt, model, processor, device)
@@ -132,23 +187,32 @@ def get_watermark_mask(image: MatLike, model: Florence2ForConditionalGeneration,
             if (bbox_area / image_area) * 100 <= max_bbox_percent:
                 draw.rectangle([x1, y1, x2, y2], fill=255)
             else:
-                logger.warning(f"Skipping large bounding box: {bbox} covering {bbox_area / image_area:.2%} of the image")
+                logger.warning(
+                    f"Skipping large bounding box: {bbox} covering {bbox_area / image_area:.2%} of the image"
+                )
 
     return mask
 
 
-def detect_only(image: MatLike, model: Florence2ForConditionalGeneration, processor: AutoProcessor, device: str, max_bbox_percent: float, detection_prompt: str = "watermark"):
-    """
-    Detect watermarks and return bounding boxes WITHOUT creating mask or inpainting.
+def detect_only(
+    image: Image.Image,
+    model: Florence2ForConditionalGeneration,
+    processor: AutoProcessor,
+    device: str,
+    max_bbox_percent: float,
+    detection_prompt: str = "watermark",
+) -> list[DetectionResult]:
+    """Detect watermarks and return bounding boxes without inpainting.
+
     Used for preview mode to show what would be detected.
 
     Returns:
-        list of dicts with bbox info: [{"bbox": [x1,y1,x2,y2], "area_percent": float, "accepted": bool}, ...]
+        List of detection results with bbox, area_percent, and accepted status.
     """
     task_prompt = TaskType.OPEN_VOCAB_DETECTION
     parsed_answer = identify(task_prompt, image, detection_prompt, model, processor, device)
 
-    results = []
+    results: list[DetectionResult] = []
     detection_key = "<OPEN_VOCABULARY_DETECTION>"
 
     if detection_key in parsed_answer and "bboxes" in parsed_answer[detection_key]:
@@ -159,16 +223,23 @@ def detect_only(image: MatLike, model: Florence2ForConditionalGeneration, proces
             area_percent = (bbox_area / image_area) * 100
             accepted = area_percent <= max_bbox_percent
 
-            results.append({
-                "bbox": [x1, y1, x2, y2],
-                "area_percent": round(area_percent, 2),
-                "accepted": accepted
-            })
+            results.append(
+                {
+                    "bbox": [x1, y1, x2, y2],
+                    "area_percent": round(area_percent, 2),
+                    "accepted": accepted,
+                }
+            )
 
     return results
 
 
-def process_image_with_lama(image: MatLike, mask: MatLike, model_manager: ModelManager):
+def process_image_with_lama(
+    image: NDArray[np.uint8],
+    mask: NDArray[np.uint8],
+    model_manager: ModelManager,
+) -> NDArray[np.uint8]:
+    """Apply LaMA inpainting to remove watermarked regions."""
     config = Config(
         ldm_steps=50,
         ldm_sampler=LDMSampler.ddim,
@@ -185,32 +256,40 @@ def process_image_with_lama(image: MatLike, mask: MatLike, model_manager: ModelM
     return result
 
 
-def make_region_transparent(image: Image.Image, mask: Image.Image):
-    image = image.convert("RGBA")
-    mask = mask.convert("L")
-    transparent_image = Image.new("RGBA", image.size)
-    for x in range(image.width):
-        for y in range(image.height):
-            if mask.getpixel((x, y)) > 0:
-                transparent_image.putpixel((x, y), (0, 0, 0, 0))
-            else:
-                transparent_image.putpixel((x, y), image.getpixel((x, y)))
-    return transparent_image
+def make_region_transparent(image: Image.Image, mask: Image.Image) -> Image.Image:
+    """Make watermark regions transparent using vectorized NumPy operations."""
+    img_array = np.array(image.convert("RGBA"))
+    mask_array = np.array(mask.convert("L"))
+    img_array[:, :, 3] = np.where(mask_array > 0, 0, 255)
+    return Image.fromarray(img_array, mode="RGBA")
 
 
-def is_video_file(file_path):
-    """Check if the file is a video based on its extension"""
-    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm']
-    return Path(file_path).suffix.lower() in video_extensions
+VIDEO_EXTENSIONS = frozenset({".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm"})
 
 
-def has_audio_stream(file_path):
+def is_video_file(file_path: str | Path) -> bool:
+    """Check if the file is a video based on its extension."""
+    return Path(file_path).suffix.lower() in VIDEO_EXTENSIONS
+
+
+def has_audio_stream(file_path: str | Path) -> bool:
     """Check if a video file has an audio stream using ffprobe."""
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(file_path)],
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                str(file_path),
+            ],
             capture_output=True,
-            text=True
+            text=True,
         )
         return "audio" in result.stdout
     except (subprocess.SubprocessError, FileNotFoundError):
@@ -218,10 +297,15 @@ def has_audio_stream(file_path):
         return True
 
 
-def parse_coords(coords: str = None, coords_file: str = None, coords_percent: str = None,
-                 preset: str = None, width: int = None, height: int = None) -> list:
-    """
-    Parse user-provided watermark coordinates into a list of bboxes.
+def parse_coords(
+    coords: str | None = None,
+    coords_file: str | None = None,
+    coords_percent: str | None = None,
+    preset: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
+) -> list[list[int]]:
+    """Parse user-provided watermark coordinates into a list of bboxes.
 
     Args:
         coords: JSON string of absolute pixel coordinates
@@ -233,20 +317,29 @@ def parse_coords(coords: str = None, coords_file: str = None, coords_percent: st
 
     Returns:
         List of bboxes: [[x1, y1, x2, y2], ...]
-    """
-    import json
 
-    bboxes = []
-    percent_coords = None
+    Raises:
+        ValueError: If coordinates are invalid or required dimensions are missing.
+    """
+    bboxes: list[list[int]] = []
+    percent_coords: list[list[float]] | None = None
 
     if preset:
         if preset.lower() not in WATERMARK_PRESETS:
-            raise ValueError(f"Unknown preset: {preset}. Available: {list(WATERMARK_PRESETS.keys())}")
+            available = ", ".join(WATERMARK_PRESETS.keys())
+            raise ValueError(f"Unknown preset: '{preset}'. Available presets: {available}")
         percent_coords = WATERMARK_PRESETS[preset.lower()]["coords_percent"]
 
     elif coords:
-        parsed = json.loads(coords)
-        if parsed and isinstance(parsed[0], (int, float)):
+        try:
+            parsed = json.loads(coords)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Invalid JSON in --coords: {e.msg}. Expected: [x1,y1,x2,y2] or [[x1,y1,x2,y2],...]"
+            ) from e
+        if not isinstance(parsed, list) or not parsed:
+            raise ValueError("--coords must be a non-empty list")
+        if isinstance(parsed[0], (int, float)):
             bboxes = [list(map(int, parsed))]
         else:
             bboxes = [list(map(int, b)) for b in parsed]
@@ -284,20 +377,24 @@ def parse_coords(coords: str = None, coords_file: str = None, coords_percent: st
     return bboxes
 
 
-def validate_bboxes(bboxes: list, width: int, height: int, max_bbox_percent: float = None) -> list:
-    """
-    Validate and sanitize bounding boxes.
+def validate_bboxes(
+    bboxes: list[list[int | float]],
+    width: int,
+    height: int,
+    max_bbox_percent: float | None = None,
+) -> list[list[int]]:
+    """Validate and sanitize bounding boxes.
 
     Args:
         bboxes: List of [x1, y1, x2, y2] coordinates
         width: Image/video width
         height: Image/video height
-        max_bbox_percent: Optional max size check
+        max_bbox_percent: Optional max size check (rejects if exceeded)
 
     Returns:
-        List of validated bboxes
+        List of validated bboxes clamped to image bounds
     """
-    validated = []
+    validated: list[list[int]] = []
     image_area = width * height
 
     for bbox in bboxes:
@@ -337,9 +434,8 @@ def validate_bboxes(bboxes: list, width: int, height: int, max_bbox_percent: flo
     return validated
 
 
-def create_mask_from_bboxes(bboxes: list, width: int, height: int) -> Image.Image:
-    """
-    Create a binary mask from bounding boxes.
+def create_mask_from_bboxes(bboxes: list[list[int]], width: int, height: int) -> Image.Image:
+    """Create a binary mask from bounding boxes.
 
     Args:
         bboxes: List of [x1, y1, x2, y2] coordinates
@@ -347,7 +443,7 @@ def create_mask_from_bboxes(bboxes: list, width: int, height: int) -> Image.Imag
         height: Image height
 
     Returns:
-        PIL Image in "L" mode (255=watermark, 0=keep)
+        PIL Image in "L" mode (255=watermark region, 0=keep)
     """
     mask = Image.new("L", (width, height), 0)
     draw = ImageDraw.Draw(mask)
@@ -359,12 +455,102 @@ def create_mask_from_bboxes(bboxes: list, width: int, height: int) -> Image.Imag
     return mask
 
 
-def process_video(input_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt="watermark", progress_offset=0, progress_scale=100):
-    """Process a video file by extracting frames, removing watermarks, and reconstructing the video"""
+def _get_video_fourcc(output_format: str) -> int:
+    """Get OpenCV fourcc code for output format."""
+    codecs = {"MP4": "mp4v", "AVI": "XVID"}
+    return cv2.VideoWriter_fourcc(*codecs.get(output_format.upper(), "mp4v"))
+
+
+def _resolve_video_output_path(
+    input_path: Path,
+    output_path: Path,
+    force_format: str | None,
+) -> tuple[Path, str]:
+    """Determine output path and format for video processing.
+
+    Returns:
+        Tuple of (output_file_path, output_format)
+    """
+    output_format = (force_format or "MP4").upper()
+    if output_path.is_dir():
+        output_file = output_path / f"{input_path.stem}_no_watermark.{output_format.lower()}"
+    else:
+        output_file = output_path.with_suffix(f".{output_format.lower()}")
+    return output_file, output_format
+
+
+def _merge_audio_to_video(
+    temp_video: Path,
+    input_path: Path,
+    output_file: Path,
+) -> bool:
+    """Merge original audio with processed video using FFmpeg.
+
+    Returns:
+        True if merge successful, False if fallback to copy was used.
+    """
+    # Check if FFmpeg is available
+    try:
+        subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT)
+    except (subprocess.SubprocessError, FileNotFoundError):
+        logger.warning("FFmpeg not available. Video will be produced without audio.")
+        shutil.copy(str(temp_video), str(output_file))
+        return False
+
+    if not has_audio_stream(input_path):
+        logger.info("Original video has no audio. Copying video only.")
+        shutil.copy(str(temp_video), str(output_file))
+        return True
+
+    logger.info("Merging processed video with original audio...")
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(temp_video),
+        "-i",
+        str(input_path),
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-shortest",
+        str(output_file),
+    ]
+    try:
+        subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+        logger.info("Audio/video merge completed successfully!")
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error during audio/video merge: {e}")
+        shutil.copy(str(temp_video), str(output_file))
+        return False
+
+
+def process_video(
+    input_path: Path | str,
+    output_path: Path | str,
+    florence_model: Florence2ForConditionalGeneration,
+    florence_processor: AutoProcessor,
+    model_manager: ModelManager,
+    device: str,
+    transparent: bool,
+    max_bbox_percent: float,
+    force_format: str | None,
+    detection_prompt: str = "watermark",
+    progress_offset: int = 0,
+    progress_scale: int = 100,
+) -> Path | None:
+    """Process a video file by extracting frames, removing watermarks, and reconstructing."""
+    input_path = Path(input_path)
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
         logger.error(f"Error opening video file: {input_path}")
-        return
+        return None
 
     # Get video properties
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -372,31 +558,14 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Determine output format
-    if force_format:
-        output_format = force_format.upper()
-    else:
-        output_format = "MP4"  # Default to MP4 for videos
-
-    # Create output video file
-    output_path = Path(output_path)
-    if output_path.is_dir():
-        output_file = output_path / f"{input_path.stem}_no_watermark.{output_format.lower()}"
-    else:
-        output_file = output_path.with_suffix(f".{output_format.lower()}")
+    # Resolve output path and format
+    output_file, output_format = _resolve_video_output_path(input_path, Path(output_path), force_format)
 
     # Create a temporary file for the video without audio
     temp_dir = tempfile.mkdtemp()
     temp_video_path = Path(temp_dir) / f"temp_no_audio.{output_format.lower()}"
 
-    # Set codec based on output format
-    if output_format.upper() == "MP4":
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    elif output_format.upper() == "AVI":
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    else:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Default to MP4
-
+    fourcc = _get_video_fourcc(output_format)
     out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (width, height))
 
     # Process each frame
@@ -412,7 +581,9 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
             pil_image = Image.fromarray(frame_rgb)
 
             # Get watermark mask
-            mask_image = get_watermark_mask(pil_image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
+            mask_image = get_watermark_mask(
+                pil_image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt
+            )
 
             # Process frame
             if transparent:
@@ -441,66 +612,49 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
     cap.release()
     out.release()
 
-    # Combine processed video with original audio using FFmpeg (if audio exists)
+    # Merge audio and cleanup
+    _merge_audio_to_video(temp_video_path, input_path, output_file)
     try:
-        # Check if FFmpeg is available
-        try:
-            subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT)
-            ffmpeg_available = True
-        except (subprocess.SubprocessError, FileNotFoundError):
-            ffmpeg_available = False
-
-        if not ffmpeg_available:
-            logger.warning("FFmpeg not available. Video will be produced without audio.")
-            shutil.copy(str(temp_video_path), str(output_file))
-        elif not has_audio_stream(input_path):
-            logger.info("Original video has no audio. Copying video only.")
-            shutil.copy(str(temp_video_path), str(output_file))
-        else:
-            logger.info("Merging processed video with original audio...")
-            ffmpeg_cmd = [
-                "ffmpeg", "-y",
-                "-i", str(temp_video_path),
-                "-i", str(input_path),
-                "-c:v", "copy",
-                "-c:a", "copy",
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-shortest",
-                str(output_file)
-            ]
-            subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
-            logger.info("Audio/video merge completed successfully!")
-    except Exception as e:
-        logger.error(f"Error during audio/video merge: {str(e)}")
-        shutil.copy(str(temp_video_path), str(output_file))
-    finally:
-        # Clean up temporary files
-        try:
-            os.remove(str(temp_video_path))
-            os.rmdir(temp_dir)
-        except:
-            pass
+        os.remove(str(temp_video_path))
+        os.rmdir(temp_dir)
+    except OSError:
+        pass
 
     final_progress = progress_offset + progress_scale
     logger.info(f"input_path:{input_path}, output_path:{output_file}, overall_progress:{final_progress}")
     return output_file
 
 
-def process_video_two_pass(input_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt="watermark", detection_skip=1, fade_in_sec=0.0, fade_out_sec=0.0, progress_offset=0, progress_scale=100):
-    """
-    Two-pass video processing with frame skip detection and fade in/out handling.
+def process_video_two_pass(
+    input_path: Path | str,
+    output_path: Path | str,
+    florence_model: Florence2ForConditionalGeneration,
+    florence_processor: AutoProcessor,
+    model_manager: ModelManager,
+    device: str,
+    transparent: bool,
+    max_bbox_percent: float,
+    force_format: str | None,
+    detection_prompt: str = "watermark",
+    detection_skip: int = 1,
+    fade_in_sec: float = 0.0,
+    fade_out_sec: float = 0.0,
+    progress_offset: int = 0,
+    progress_scale: int = 100,
+) -> Path | None:
+    """Two-pass video processing with frame skip detection and fade handling.
 
     Pass 1: Detect watermarks every N frames (sparse detection)
     Pass 2: Apply inpainting to all frames using interpolated masks
 
-    This is more efficient for videos where watermarks don't change rapidly,
-    and handles fade in/out watermarks by extending the mask temporally.
+    More efficient for videos with static watermarks and handles fade in/out
+    by extending the mask temporally.
     """
+    input_path = Path(input_path)
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
         logger.error(f"Error opening video file: {input_path}")
-        return
+        return None
 
     # Get video properties
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -512,20 +666,12 @@ def process_video_two_pass(input_path, output_path, florence_model, florence_pro
     fade_in_frames = int(fade_in_sec * fps)
     fade_out_frames = int(fade_out_sec * fps)
 
-    logger.info(f"Two-pass processing: {total_frames} frames, skip={detection_skip}, fade_in={fade_in_frames}f, fade_out={fade_out_frames}f")
+    logger.info(
+        f"Two-pass processing: {total_frames} frames, skip={detection_skip}, fade_in={fade_in_frames}f, fade_out={fade_out_frames}f"
+    )
 
-    # Determine output format
-    if force_format:
-        output_format = force_format.upper()
-    else:
-        output_format = "MP4"
-
-    # Create output video file
-    output_path = Path(output_path)
-    if output_path.is_dir():
-        output_file = output_path / f"{input_path.stem}_no_watermark.{output_format.lower()}"
-    else:
-        output_file = output_path.with_suffix(f".{output_format.lower()}")
+    # Resolve output path and format
+    output_file, output_format = _resolve_video_output_path(input_path, Path(output_path), force_format)
 
     # ========== PASS 1: DETECTION (sparse) ==========
     logger.info("Pass 1: Detecting watermarks...")
@@ -540,7 +686,9 @@ def process_video_two_pass(input_path, output_path, florence_model, florence_pro
                 break
 
             pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            bboxes = detect_only(pil_image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
+            bboxes = detect_only(
+                pil_image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt
+            )
 
             if bboxes:
                 accepted_bboxes = [b["bbox"] for b in bboxes if b["accepted"]]
@@ -582,14 +730,7 @@ def process_video_two_pass(input_path, output_path, florence_model, florence_pro
     temp_dir = tempfile.mkdtemp()
     temp_video_path = Path(temp_dir) / f"temp_no_audio.{output_format.lower()}"
 
-    # Set codec
-    if output_format.upper() == "MP4":
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    elif output_format.upper() == "AVI":
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    else:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-
+    fourcc = _get_video_fourcc(output_format)
     out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (width, height))
 
     # Reset video to beginning
@@ -638,59 +779,36 @@ def process_video_two_pass(input_path, output_path, florence_model, florence_pro
     cap.release()
     out.release()
 
-    # ========== MERGE WITH AUDIO (if exists) ==========
+    # Merge audio and cleanup
+    _merge_audio_to_video(temp_video_path, input_path, output_file)
     try:
-        try:
-            subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT)
-            ffmpeg_available = True
-        except (subprocess.SubprocessError, FileNotFoundError):
-            ffmpeg_available = False
-
-        if not ffmpeg_available:
-            logger.warning("FFmpeg not available. Video will be produced without audio.")
-            shutil.copy(str(temp_video_path), str(output_file))
-        elif not has_audio_stream(input_path):
-            logger.info("Original video has no audio. Copying video only.")
-            shutil.copy(str(temp_video_path), str(output_file))
-        else:
-            logger.info("Merging processed video with original audio...")
-            ffmpeg_cmd = [
-                "ffmpeg", "-y",
-                "-i", str(temp_video_path),
-                "-i", str(input_path),
-                "-c:v", "copy",
-                "-c:a", "copy",
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-shortest",
-                str(output_file)
-            ]
-            subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
-            logger.info("Audio/video merge completed successfully!")
-    except Exception as e:
-        logger.error(f"Error during audio/video merge: {str(e)}")
-        shutil.copy(str(temp_video_path), str(output_file))
-    finally:
-        try:
-            os.remove(str(temp_video_path))
-            os.rmdir(temp_dir)
-        except:
-            pass
+        os.remove(str(temp_video_path))
+        os.rmdir(temp_dir)
+    except OSError:
+        pass
 
     final_progress = progress_offset + progress_scale
     logger.info(f"input_path:{input_path}, output_path:{output_file}, overall_progress:{final_progress}")
     return output_file
 
 
-def process_video_fixed_coords(input_path, output_path, bboxes, model_manager, transparent=False, force_format=None, progress_offset=0, progress_scale=100):
-    """
-    Process video with fixed watermark coordinates (no AI detection).
+def process_video_fixed_coords(
+    input_path: Path | str,
+    output_path: Path | str,
+    bboxes: list[list[int]],
+    model_manager: ModelManager | None,
+    transparent: bool = False,
+    force_format: str | None = None,
+    progress_offset: int = 0,
+    progress_scale: int = 100,
+) -> Path | None:
+    """Process video with fixed watermark coordinates (no AI detection).
 
-    This is the most efficient mode for videos with static watermarks:
+    Most efficient mode for videos with static watermarks:
     - Creates mask ONCE from provided coordinates
     - Applies identical mask to ALL frames
     - No Florence-2 model needed
-    - Pipes raw frames directly to FFmpeg (single H.264 encode, no intermediate file)
+    - Pipes raw frames directly to FFmpeg when available
 
     Args:
         input_path: Input video path
@@ -703,7 +821,7 @@ def process_video_fixed_coords(input_path, output_path, bboxes, model_manager, t
         progress_scale: Progress range for this operation
 
     Returns:
-        Path to output video file
+        Path to output video file, or None on failure
     """
     input_path = Path(input_path)
     cap = cv2.VideoCapture(str(input_path))
@@ -726,18 +844,8 @@ def process_video_fixed_coords(input_path, output_path, bboxes, model_manager, t
 
     logger.info(f"Created static mask covering {np.sum(mask_array > 0)} pixels")
 
-    # Determine output format
-    if force_format:
-        output_format = force_format.upper()
-    else:
-        output_format = "MP4"
-
-    # Create output video file
-    output_path = Path(output_path)
-    if output_path.is_dir():
-        output_file = output_path / f"{input_path.stem}_no_watermark.{output_format.lower()}"
-    else:
-        output_file = output_path.with_suffix(f".{output_format.lower()}")
+    # Resolve output path and format
+    output_file, output_format = _resolve_video_output_path(input_path, Path(output_path), force_format)
 
     # Check if FFmpeg is available for direct piping
     ffmpeg_available = False
@@ -760,22 +868,35 @@ def process_video_fixed_coords(input_path, output_path, bboxes, model_manager, t
 
         # FFmpeg command to read raw video frames from stdin and encode with H.264
         ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-s", f"{width}x{height}",
-            "-r", str(fps),
-            "-i", "-",
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(fps),
+            "-i",
+            "-",
         ]
         if has_audio:
             ffmpeg_cmd.extend(["-i", str(input_path)])
-        ffmpeg_cmd.extend([
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "18",
-            "-pix_fmt", "yuv420p",
-        ])
+        ffmpeg_cmd.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        )
         if has_audio:
             ffmpeg_cmd.extend(["-c:a", "copy", "-map", "0:v:0", "-map", "1:a:0", "-shortest"])
         ffmpeg_cmd.append(str(output_file))
@@ -784,10 +905,7 @@ def process_video_fixed_coords(input_path, output_path, bboxes, model_manager, t
         # Note: stderr must go to DEVNULL to prevent buffer deadlock
         # (FFmpeg writes lots of progress info to stderr which fills the pipe buffer)
         ffmpeg_proc = subprocess.Popen(
-            ffmpeg_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
 
         # Process all frames with the SAME mask
@@ -840,11 +958,11 @@ def process_video_fixed_coords(input_path, output_path, bboxes, model_manager, t
         temp_video_path = Path(temp_dir) / f"temp_no_audio.{output_format.lower()}"
 
         if output_format.upper() == "MP4":
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         elif output_format.upper() == "AVI":
-            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            fourcc = cv2.VideoWriter_fourcc(*"XVID")
         else:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
         out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (width, height))
 
@@ -883,7 +1001,7 @@ def process_video_fixed_coords(input_path, output_path, bboxes, model_manager, t
         try:
             os.remove(str(temp_video_path))
             os.rmdir(temp_dir)
-        except:
+        except OSError:
             pass
 
     final_progress = progress_offset + progress_scale
@@ -891,29 +1009,76 @@ def process_video_fixed_coords(input_path, output_path, bboxes, model_manager, t
     return output_file
 
 
-def handle_one(image_path: Path, output_path: Path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt="watermark", detection_skip=1, fade_in=0.0, fade_out=0.0, progress_offset=0, progress_scale=100):
+def handle_one(
+    image_path: Path,
+    output_path: Path,
+    florence_model: Florence2ForConditionalGeneration,
+    florence_processor: AutoProcessor,
+    model_manager: ModelManager | None,
+    device: str,
+    transparent: bool,
+    max_bbox_percent: float,
+    force_format: str | None,
+    overwrite: bool,
+    detection_prompt: str = "watermark",
+    detection_skip: int = 1,
+    fade_in: float = 0.0,
+    fade_out: float = 0.0,
+    progress_offset: int = 0,
+    progress_scale: int = 100,
+) -> Path | None:
+    """Process a single image or video file."""
     # SAFETY: Never overwrite the input file
     if image_path.resolve() == output_path.resolve():
         logger.error(f"Cannot overwrite input file: {image_path}. Choose a different output path.")
-        print(f"ERROR: Cannot overwrite input file! Choose a different output folder.")
-        return
+        print("ERROR: Cannot overwrite input file! Choose a different output folder.")
+        return None
 
     if output_path.exists() and not overwrite:
         logger.info(f"Skipping existing file: {output_path}")
-        return
+        return None
 
-    # Check if it's a video file
+    # Handle video files
     if is_video_file(image_path):
-        # Use two-pass if detection_skip > 1 or fade handling is needed
         use_two_pass = detection_skip > 1 or fade_in > 0 or fade_out > 0
         if use_two_pass:
-            return process_video_two_pass(image_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt, detection_skip, fade_in, fade_out, progress_offset, progress_scale)
-        else:
-            return process_video(image_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt, progress_offset, progress_scale)
+            return process_video_two_pass(
+                image_path,
+                output_path,
+                florence_model,
+                florence_processor,
+                model_manager,
+                device,
+                transparent,
+                max_bbox_percent,
+                force_format,
+                detection_prompt,
+                detection_skip,
+                fade_in,
+                fade_out,
+                progress_offset,
+                progress_scale,
+            )
+        return process_video(
+            image_path,
+            output_path,
+            florence_model,
+            florence_processor,
+            model_manager,
+            device,
+            transparent,
+            max_bbox_percent,
+            force_format,
+            detection_prompt,
+            progress_offset,
+            progress_scale,
+        )
 
     # Process image
     image = Image.open(image_path).convert("RGB")
-    mask_image = get_watermark_mask(image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
+    mask_image = get_watermark_mask(
+        image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt
+    )
 
     if transparent:
         result_image = make_region_transparent(image, mask_image)
@@ -928,26 +1093,41 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
         output_format = "PNG"
     else:
         output_format = image_path.suffix[1:].upper()
-        if output_format not in ["PNG", "WEBP", "JPG"]:
+        if output_format not in ("PNG", "WEBP", "JPG"):
             output_format = "PNG"
 
     # Map JPG to JPEG for PIL compatibility
     if output_format == "JPG":
         output_format = "JPEG"
 
-    if transparent and output_format == "JPG":
-        logger.warning("Transparency detected. Defaulting to PNG for transparency support.")
+    if transparent and output_format == "JPEG":
+        logger.warning("Transparency requested but JPEG doesn't support it. Using PNG.")
         output_format = "PNG"
 
     new_output_path = output_path.with_suffix(f".{output_format.lower()}")
     result_image.save(new_output_path, format=output_format)
-    # Report progress for this image (end of range)
     final_progress = progress_offset + progress_scale
     print(f"input_path:{image_path}, output_path:{new_output_path}, overall_progress:{final_progress}%")
     return new_output_path
 
 
-def process(input_path: str, output_path: str, preview: bool = False, overwrite: bool = False, transparent: bool = False, max_bbox_percent: float = 10.0, force_format: str = None, detection_prompt: str = "watermark", detection_skip: int = 1, fade_in: float = 0.0, fade_out: float = 0.0, preset: str = None, coords: str = None, coords_file: str = None, coords_percent: str = None):
+def process(
+    input_path: str,
+    output_path: str | None,
+    preview: bool = False,
+    overwrite: bool = False,
+    transparent: bool = False,
+    max_bbox_percent: float = 10.0,
+    force_format: str | None = None,
+    detection_prompt: str = "watermark",
+    detection_skip: int = 1,
+    fade_in: float = 0.0,
+    fade_out: float = 0.0,
+    preset: str | None = None,
+    coords: str | None = None,
+    coords_file: str | None = None,
+    coords_percent: str | None = None,
+) -> Path | None:
     """Main processing function - called by CLI."""
     # Input validation
     if detection_skip < 1 or detection_skip > 10:
@@ -966,7 +1146,9 @@ def process(input_path: str, output_path: str, preview: bool = False, overwrite:
     # Validate mutually exclusive options
     coord_options = [preset, coords, coords_file, coords_percent]
     if sum(1 for opt in coord_options if opt) > 1:
-        logger.error("Cannot use multiple coordinate options together. Choose one of: --preset, --coords, --coords-file, --coords-percent")
+        logger.error(
+            "Cannot use multiple coordinate options together. Choose one of: --preset, --coords, --coords-file, --coords-percent"
+        )
         return
 
     if use_fixed_coords and preview:
@@ -1032,7 +1214,7 @@ def process(input_path: str, output_path: str, preview: bool = False, overwrite:
 
             if is_video_file(input_path):
                 # Ensure video output has proper extension
-                if output_file.suffix.lower() not in ['.mp4', '.avi', '.mov', '.mkv']:
+                if output_file.suffix.lower() not in [".mp4", ".avi", ".mov", ".mkv"]:
                     if force_format and force_format.upper() in ["MP4", "AVI"]:
                         output_file = output_file.with_suffix(f".{force_format.lower()}")
                     else:
@@ -1073,7 +1255,12 @@ def process(input_path: str, output_path: str, preview: bool = False, overwrite:
             output_path.mkdir(parents=True)
 
         images = list(input_path.glob("*.[jp][pn]g")) + list(input_path.glob("*.webp"))
-        videos = list(input_path.glob("*.mp4")) + list(input_path.glob("*.avi")) + list(input_path.glob("*.mov")) + list(input_path.glob("*.mkv"))
+        videos = (
+            list(input_path.glob("*.mp4"))
+            + list(input_path.glob("*.avi"))
+            + list(input_path.glob("*.mov"))
+            + list(input_path.glob("*.mkv"))
+        )
         files = images + videos
         total_files = len(files)
 
@@ -1107,9 +1294,18 @@ def process(input_path: str, output_path: str, preview: bool = False, overwrite:
             progress_scale = int(100 / total_files)
 
             if is_video_file(file_path):
-                if output_file.suffix.lower() not in ['.mp4', '.avi']:
+                if output_file.suffix.lower() not in [".mp4", ".avi"]:
                     output_file = output_file.with_suffix(".mp4")
-                process_video_fixed_coords(file_path, output_file, bboxes, model_manager, transparent, force_format, progress_offset, progress_scale)
+                process_video_fixed_coords(
+                    file_path,
+                    output_file,
+                    bboxes,
+                    model_manager,
+                    transparent,
+                    force_format,
+                    progress_offset,
+                    progress_scale,
+                )
             else:
                 image = Image.open(file_path).convert("RGB")
                 mask = create_mask_from_bboxes(bboxes, width, height)
@@ -1134,7 +1330,9 @@ def process(input_path: str, output_path: str, preview: bool = False, overwrite:
 
                 output_file = output_file.with_suffix(f".{output_format.lower()}")
                 result_image.save(output_file, format=output_format)
-                print(f"input_path:{file_path}, output_path:{output_file}, overall_progress:{progress_offset + progress_scale}%")
+                print(
+                    f"input_path:{file_path}, output_path:{output_file}, overall_progress:{progress_offset + progress_scale}%"
+                )
 
         return
 
@@ -1146,7 +1344,9 @@ def process(input_path: str, output_path: str, preview: bool = False, overwrite:
         from io import BytesIO
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        florence_model = Florence2ForConditionalGeneration.from_pretrained("florence-community/Florence-2-large").to(device).eval()
+        florence_model = (
+            Florence2ForConditionalGeneration.from_pretrained("florence-community/Florence-2-large").to(device).eval()
+        )
         florence_processor = AutoProcessor.from_pretrained("florence-community/Florence-2-large")
 
         # Get sample image from input
@@ -1182,7 +1382,9 @@ def process(input_path: str, output_path: str, preview: bool = False, overwrite:
             source_frame = None
 
         # Run detection
-        detections = detect_only(pil_image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
+        detections = detect_only(
+            pil_image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt
+        )
 
         # Draw bounding boxes on image
         draw = ImageDraw.Draw(pil_image)
@@ -1207,7 +1409,7 @@ def process(input_path: str, output_path: str, preview: bool = False, overwrite:
             "source_type": source_type,
             "source_frame": source_frame,
             "prompt_used": detection_prompt,
-            "max_bbox_percent": max_bbox_percent
+            "max_bbox_percent": max_bbox_percent,
         }
         print(json.dumps(result))
         return
@@ -1217,7 +1419,9 @@ def process(input_path: str, output_path: str, preview: bool = False, overwrite:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    florence_model = Florence2ForConditionalGeneration.from_pretrained("florence-community/Florence-2-large").to(device).eval()
+    florence_model = (
+        Florence2ForConditionalGeneration.from_pretrained("florence-community/Florence-2-large").to(device).eval()
+    )
     florence_processor = AutoProcessor.from_pretrained("florence-community/Florence-2-large")
     logger.info("Florence-2 Model loaded")
 
@@ -1233,7 +1437,12 @@ def process(input_path: str, output_path: str, preview: bool = False, overwrite:
 
         # Include video files in the search
         images = list(input_path.glob("*.[jp][pn]g")) + list(input_path.glob("*.webp"))
-        videos = list(input_path.glob("*.mp4")) + list(input_path.glob("*.avi")) + list(input_path.glob("*.mov")) + list(input_path.glob("*.mkv"))
+        videos = (
+            list(input_path.glob("*.mp4"))
+            + list(input_path.glob("*.avi"))
+            + list(input_path.glob("*.mov"))
+            + list(input_path.glob("*.mkv"))
+        )
         files = images + videos
         total_files = len(files)
 
@@ -1242,7 +1451,24 @@ def process(input_path: str, output_path: str, preview: bool = False, overwrite:
             # Calculate progress range for this file
             progress_offset = int(idx / total_files * 100)
             progress_scale = int(100 / total_files)
-            handle_one(file_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt, detection_skip, fade_in, fade_out, progress_offset, progress_scale)
+            handle_one(
+                file_path,
+                output_file,
+                florence_model,
+                florence_processor,
+                model_manager,
+                device,
+                transparent,
+                max_bbox_percent,
+                force_format,
+                overwrite,
+                detection_prompt,
+                detection_skip,
+                fade_in,
+                fade_out,
+                progress_offset,
+                progress_scale,
+            )
     else:
         # Single file mode - if output is a directory, construct file path
         if output_path.is_dir():
@@ -1251,11 +1477,26 @@ def process(input_path: str, output_path: str, preview: bool = False, overwrite:
             output_file = output_path
 
         # Ensure video output has proper extension
-        if is_video_file(input_path) and output_file.suffix.lower() not in ['.mp4', '.avi', '.mov', '.mkv']:
+        if is_video_file(input_path) and output_file.suffix.lower() not in [".mp4", ".avi", ".mov", ".mkv"]:
             if force_format and force_format.upper() in ["MP4", "AVI"]:
                 output_file = output_file.with_suffix(f".{force_format.lower()}")
             else:
                 output_file = output_file.with_suffix(".mp4")  # Default to mp4
 
-        handle_one(input_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt, detection_skip, fade_in, fade_out)
+        handle_one(
+            input_path,
+            output_file,
+            florence_model,
+            florence_processor,
+            model_manager,
+            device,
+            transparent,
+            max_bbox_percent,
+            force_format,
+            overwrite,
+            detection_prompt,
+            detection_skip,
+            fade_in,
+            fade_out,
+        )
         print(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")

@@ -1,91 +1,100 @@
 """Utility functions for WatermarkRemover-AI."""
 
+from __future__ import annotations
+
 import random
-from enum import Enum
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from PIL import ImageDraw
+from PIL import Image, ImageDraw
 
-# Constants
-colormap = ['blue', 'orange', 'green', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan', 'red',
-            'lime', 'indigo', 'violet', 'aqua', 'magenta', 'coral', 'gold', 'tan', 'skyblue']
+if TYPE_CHECKING:
+    pass
 
-# To be set
-model = None
-processor = None
-
-
-def set_model_info(model_, processor_):
-    global model, processor
-    model = model_
-    processor = processor_
-
-
-class TaskType(str, Enum):
-    """The types of tasks supported"""
-    CAPTION = '<CAPTION>'
-    DETAILED_CAPTION = '<DETAILED_CAPTION>'
-    MORE_DETAILED_CAPTION = '<MORE_DETAILED_CAPTION>'
-
-
-def run_example(task_prompt: TaskType, image, text_input=None):
-    """Runs an inference task using the model."""
-    if not isinstance(task_prompt, TaskType):
-        raise ValueError(f"task_prompt must be a TaskType, but {task_prompt} is of type {type(task_prompt)}")
-
-    prompt = task_prompt.value if text_input is None else task_prompt.value + text_input
-    inputs = processor(text=prompt, images=image, return_tensors="pt")
-    generated_ids = model.generate(
-        input_ids=inputs["input_ids"].cuda(),
-        pixel_values=inputs["pixel_values"].cuda(),
-        max_new_tokens=1024,
-        early_stopping=False,
-        do_sample=False,
-        num_beams=3,
-    )
-    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-    parsed_answer = processor.post_process_generation(
-        generated_text,
-        task=task_prompt.value,
-        image_size=(image.width, image.height)
-    )
-    return parsed_answer
+# Color palette for visualization
+COLORMAP: tuple[str, ...] = (
+    "blue",
+    "orange",
+    "green",
+    "purple",
+    "brown",
+    "pink",
+    "gray",
+    "olive",
+    "cyan",
+    "red",
+    "lime",
+    "indigo",
+    "violet",
+    "aqua",
+    "magenta",
+    "coral",
+    "gold",
+    "tan",
+    "skyblue",
+)
 
 
-def draw_polygons(image, prediction, fill_mask=False):
-    """Draws segmentation masks with polygons on an image."""
+def draw_polygons(
+    image: Image.Image,
+    prediction: dict[str, Any],
+    fill_mask: bool = False,
+) -> Image.Image:
+    """Draw segmentation masks with polygons on an image.
+
+    Args:
+        image: PIL Image to draw on
+        prediction: Dict with 'polygons' and 'labels' keys
+        fill_mask: Whether to fill the polygons
+
+    Returns:
+        Image with polygons drawn
+    """
     draw = ImageDraw.Draw(image)
-    for polygons, label in zip(prediction['polygons'], prediction['labels']):
-        color = random.choice(colormap)
-        fill_color = random.choice(colormap) if fill_mask else None
+    for polygons, label in zip(prediction["polygons"], prediction["labels"], strict=True):
+        color = random.choice(COLORMAP)
+        fill_color = random.choice(COLORMAP) if fill_mask else None
 
         for polygon in polygons:
-            polygon = np.array(polygon).reshape(-1, 2)
-            if len(polygon) < 3:
-                print('Invalid polygon:', polygon)
+            pts = np.array(polygon).reshape(-1, 2)
+            if len(pts) < 3:
                 continue
 
-            polygon = (polygon * 1).reshape(-1).tolist()  # No scaling
-            draw.polygon(polygon, outline=color, fill=fill_color)
-            draw.text((polygon[0] + 8, polygon[1] + 2), label, fill=color)
+            flat_pts = pts.reshape(-1).tolist()
+            draw.polygon(flat_pts, outline=color, fill=fill_color)
+            draw.text((flat_pts[0] + 8, flat_pts[1] + 2), label, fill=color)
 
     return image
 
 
-def draw_ocr_bboxes(image, prediction):
-    """Draws OCR bounding boxes on an image."""
+def draw_ocr_bboxes(
+    image: Image.Image,
+    prediction: dict[str, Any],
+) -> Image.Image:
+    """Draw OCR bounding boxes on an image.
+
+    Args:
+        image: PIL Image to draw on
+        prediction: Dict with 'quad_boxes' and 'labels' keys
+
+    Returns:
+        Image with bounding boxes drawn
+    """
     draw = ImageDraw.Draw(image)
-    bboxes, labels = prediction['quad_boxes'], prediction['labels']
-    for box, label in zip(bboxes, labels):
-        color = random.choice(colormap)
-        new_box = (np.array(box) * 1).tolist()  # No scaling
-        draw.polygon(new_box, width=3, outline=color)
-        draw.text((new_box[0] + 8, new_box[1] + 2), "{}".format(label), align="right", fill=color)
+    bboxes = prediction["quad_boxes"]
+    labels = prediction["labels"]
+
+    for box, label in zip(bboxes, labels, strict=True):
+        color = random.choice(COLORMAP)
+        box_pts = np.array(box).tolist()
+        draw.polygon(box_pts, width=3, outline=color)
+        draw.text((box_pts[0] + 8, box_pts[1] + 2), str(label), align="right", fill=color)
+
     return image
 
 
-def convert_bbox_to_relative(box, image):
-    """Converts bounding box pixel coordinates to relative coordinates in the range 0-999."""
+def convert_bbox_to_relative(box: list[float], image: Image.Image) -> list[float]:
+    """Convert bounding box pixel coordinates to relative coordinates (0-999 range)."""
     return [
         (box[0] / image.width) * 999,
         (box[1] / image.height) * 999,
@@ -94,8 +103,8 @@ def convert_bbox_to_relative(box, image):
     ]
 
 
-def convert_relative_to_bbox(relative, image):
-    """Converts list of relative coordinates to pixel coordinates."""
+def convert_relative_to_bbox(relative: list[float], image: Image.Image) -> list[float]:
+    """Convert relative coordinates (0-999 range) to pixel coordinates."""
     return [
         (relative[0] / 999) * image.width,
         (relative[1] / 999) * image.height,
@@ -104,7 +113,7 @@ def convert_relative_to_bbox(relative, image):
     ]
 
 
-def convert_bbox_to_loc(box, image):
-    """Converts bounding box pixel coordinates to position tokens."""
-    relative_coordinates = convert_bbox_to_relative(box, image)
-    return ''.join([f'<loc_{i}>' for i in relative_coordinates])
+def convert_bbox_to_loc(box: list[float], image: Image.Image) -> str:
+    """Convert bounding box pixel coordinates to position tokens."""
+    relative = convert_bbox_to_relative(box, image)
+    return "".join(f"<loc_{int(coord)}>" for coord in relative)

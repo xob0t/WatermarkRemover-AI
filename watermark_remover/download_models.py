@@ -1,5 +1,7 @@
 """Download AI models for WatermarkRemover-AI."""
 
+from __future__ import annotations
+
 import sys
 import threading
 import time
@@ -11,7 +13,7 @@ LAMA_MODEL_URL = "https://github.com/Sanster/models/releases/download/add_big_la
 FLORENCE_MODEL_REPO = "florence-community/Florence-2-large"
 
 # Fun facts and tips to show during download
-TIPS = [
+TIPS: tuple[dict[str, str], ...] = (
     {"icon": "[i]", "color": "cyan", "text": "Florence-2 can detect watermarks in any language - even emojis!"},
     {"icon": "[?]", "color": "yellow", "text": "Tip: Use 'Transparent mode' to keep the original background visible"},
     {"icon": "[i]", "color": "cyan", "text": "The AI model was trained on millions of images to understand context"},
@@ -30,7 +32,7 @@ TIPS = [
     {"icon": "[?]", "color": "yellow", "text": "Tip: Check the logs if something goes wrong"},
     {"icon": "[i]", "color": "cyan", "text": "The AI can handle semi-transparent watermarks too!"},
     {"icon": "[?]", "color": "yellow", "text": "Tip: Your settings are saved automatically between sessions"},
-]
+)
 
 
 class Colors:
@@ -44,7 +46,7 @@ class Colors:
     RESET = "\033[0m"
 
     @classmethod
-    def init(cls):
+    def init(cls) -> None:
         """Enable ANSI colors on Windows."""
         if sys.platform == "win32":
             try:
@@ -61,7 +63,7 @@ def get_cache_dir() -> Path:
     return Path.home() / ".cache" / "torch" / "hub" / "checkpoints"
 
 
-def print_header(text: str):
+def print_header(text: str) -> None:
     """Print a styled header."""
     print()
     print(f"  {Colors.CYAN}============================================={Colors.RESET}")
@@ -70,19 +72,22 @@ def print_header(text: str):
     print()
 
 
-def print_ok(text: str):
+def print_ok(text: str) -> None:
+    """Print a success message."""
     print(f"  {Colors.GREEN}[OK]{Colors.RESET} {text}")
 
 
-def print_warning(text: str):
+def print_warning(text: str) -> None:
+    """Print a warning message."""
     print(f"  {Colors.YELLOW}[!]{Colors.RESET} {text}")
 
 
-def print_info(text: str):
+def print_info(text: str) -> None:
+    """Print an info message."""
     print(f"  {Colors.CYAN}[*]{Colors.RESET} {text}")
 
 
-def show_rotating_tips(stop_event: threading.Event, tip_index: list):
+def show_rotating_tips(stop_event: threading.Event, tip_index: list[int]) -> None:
     """Show rotating tips while a long operation runs."""
     while not stop_event.is_set():
         tip = TIPS[tip_index[0] % len(TIPS)]
@@ -103,7 +108,7 @@ def download_with_tips(url: str, dest: Path) -> bool:
     tip_index = [0]
     success = [False]
 
-    def download():
+    def download() -> None:
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
             urllib.request.urlretrieve(url, dest)
@@ -157,7 +162,7 @@ def download_florence_model() -> bool:
     tip_index = [0]
     success = [False]
 
-    def download():
+    def download() -> None:
         try:
             from huggingface_hub import snapshot_download
 
@@ -186,7 +191,7 @@ def download_florence_model() -> bool:
     return False
 
 
-def run():
+def run() -> None:
     """Download AI models for WatermarkRemover-AI."""
     Colors.init()
 
