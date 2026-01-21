@@ -41,6 +41,15 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["watermark_remover"]
 
+[tool.hatch.build.targets.wheel.sources]
+"watermark_remover/masks" = "watermark_remover/masks"
+
+[tool.hatch.build]
+include = [
+    "watermark_remover/**/*.py",
+    "watermark_remover/masks/*.png",
+]
+
 # =============================================================================
 # UV CONFIGURATION
 # =============================================================================

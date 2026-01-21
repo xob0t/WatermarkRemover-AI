@@ -145,6 +145,47 @@ This outputs JSON with detected bboxes you can copy to `--coords`.
 | Top-right corner    | `[85, 0, 100, 10]`      |
 | Center bottom       | `[40, 90, 60, 100]`     |
 
+### Creating Custom Mask Images
+
+For watermarks with complex shapes (logos, text), you can create a precise mask image instead of using rectangular coordinates. This results in better quality since only the exact watermark pixels are inpainted.
+
+**How to create a mask:**
+
+1. Take a screenshot of a frame with the watermark visible
+2. Open in an image editor (Paint, GIMP, Photoshop, etc.)
+3. Create a new layer or image with **black background**
+4. Paint **white** over the watermark area (the exact shape you want removed)
+5. Save as PNG in grayscale
+
+**Mask format:**
+- **White (255)** = watermark area (will be removed)
+- **Black (0)** = keep as-is
+- Any resolution works - it will be resized to match your video
+
+**Example using Paint:**
+1. Open your screenshot
+2. Use the eyedropper to select white color
+3. Use brush/pencil to paint over the watermark
+4. Select All, then copy
+5. Create new image, paste, save as PNG
+
+**Using your custom mask:**
+
+Place your mask in `watermark_remover/masks/` and update the preset in `core.py`, or use it directly:
+
+```python
+# In core.py, add or modify a preset:
+WATERMARK_PRESETS = {
+    "my-watermark": {
+        "description": "My custom watermark",
+        "mask_image": "my-watermark.png",
+        "coords_percent": [[90, 90, 100, 100]],  # Fallback if mask not found
+    },
+}
+```
+
+Then use: `watermark-remover remove video.mp4 output.mp4 --preset my-watermark`
+
 ### Options
 
 | Option               | Description                                                 |

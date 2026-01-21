@@ -43,11 +43,12 @@ class DetectionResult(TypedDict):
     accepted: bool
 
 
-class WatermarkPreset(TypedDict):
-    """Predefined watermark coordinates."""
+class WatermarkPreset(TypedDict, total=False):
+    """Predefined watermark coordinates or mask image."""
 
     description: str
-    coords_percent: list[list[float]]
+    coords_percent: list[list[float]]  # Fallback: percentage-based bbox coordinates
+    mask_image: str  # Primary: filename of mask image in masks/ directory
 
 
 class PreviewResult(TypedDict):
@@ -67,9 +68,50 @@ class PreviewResult(TypedDict):
 WATERMARK_PRESETS: dict[str, WatermarkPreset] = {
     "veo": {
         "description": "Google Veo watermark (bottom-right corner)",
-        "coords_percent": [[93.5, 93.2, 98.7, 97.4]],
+        "coords_percent": [[93.5, 93.2, 98.7, 97.4]],  # Fallback if mask not found
+        "mask_image": "veo.png",
     },
 }
+
+
+def get_masks_directory() -> Path:
+    """Get the path to the masks directory within the package."""
+    return Path(__file__).parent / "masks"
+
+
+def load_preset_mask(preset_name: str, width: int, height: int) -> Image.Image | None:
+    """Load and resize a preset's mask image to match target dimensions.
+
+    Args:
+        preset_name: Name of the preset (e.g., "veo")
+        width: Target width to resize mask to
+        height: Target height to resize mask to
+
+    Returns:
+        Grayscale PIL Image (255=watermark, 0=keep) or None if not found
+    """
+    if preset_name not in WATERMARK_PRESETS:
+        return None
+
+    preset = WATERMARK_PRESETS[preset_name]
+    mask_filename = preset.get("mask_image")
+    if not mask_filename:
+        return None
+
+    mask_path = get_masks_directory() / mask_filename
+    if not mask_path.exists():
+        logger.warning(f"Mask image not found: {mask_path}. Falling back to coordinates.")
+        return None
+
+    try:
+        mask = Image.open(mask_path).convert("L")
+        # Resize to match target dimensions using NEAREST to preserve sharp edges
+        mask = mask.resize((width, height), Image.Resampling.NEAREST)
+        logger.info(f"Loaded preset mask: {mask_filename} ({width}x{height})")
+        return mask
+    except Exception as e:
+        logger.warning(f"Failed to load mask {mask_path}: {e}. Falling back to coordinates.")
+        return None
 
 
 def download_lama_model() -> bool:
@@ -912,11 +954,12 @@ def process_video_fixed_coords(
     force_format: str | None = None,
     progress_offset: int = 0,
     progress_scale: int = 100,
+    preset_mask: Image.Image | None = None,
 ) -> Path | None:
-    """Process video with fixed watermark coordinates (no AI detection).
+    """Process video with fixed watermark coordinates or preset mask (no AI detection).
 
     Most efficient mode for videos with static watermarks:
-    - Creates mask ONCE from provided coordinates
+    - Creates mask ONCE from provided coordinates or uses preset mask
     - Applies identical mask to ALL frames
     - No Florence-2 model needed
     - Pipes raw frames directly to FFmpeg when available
@@ -924,12 +967,13 @@ def process_video_fixed_coords(
     Args:
         input_path: Input video path
         output_path: Output video/directory path
-        bboxes: List of [x1,y1,x2,y2] watermark coordinates (already validated)
+        bboxes: List of [x1,y1,x2,y2] watermark coordinates (ignored if preset_mask provided)
         model_manager: LaMA model (can be None if transparent=True)
         transparent: Replace watermark with white (transparency not supported in video)
         force_format: Output format (MP4, AVI)
         progress_offset: Starting progress percentage
         progress_scale: Progress range for this operation
+        preset_mask: Pre-loaded mask image (takes precedence over bboxes)
 
     Returns:
         Path to output video file, or None on failure
@@ -947,10 +991,19 @@ def process_video_fixed_coords(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     logger.info(f"Processing video (fixed coords): {width}x{height}, {fps:.2f}fps, {total_frames} frames")
-    logger.info(f"Watermark regions: {len(bboxes)} bbox(es)")
 
-    # CREATE MASK ONCE - this is the key optimization
-    mask = create_mask_from_bboxes(bboxes, width, height)
+    # Use preset mask if provided, otherwise create from bboxes
+    if preset_mask is not None:
+        # Resize mask to match video dimensions if needed
+        if preset_mask.size != (width, height):
+            mask = preset_mask.resize((width, height), Image.Resampling.NEAREST)
+        else:
+            mask = preset_mask
+        logger.info("Using preset mask image")
+    else:
+        logger.info(f"Watermark regions: {len(bboxes)} bbox(es)")
+        mask = create_mask_from_bboxes(bboxes, width, height)
+
     mask_array = np.array(mask)
 
     logger.info(f"Created static mask covering {np.sum(mask_array > 0)} pixels")
@@ -1271,6 +1324,42 @@ def _handle_image_detection(
 # =============================================================================
 
 
+def _get_mask_for_preset_or_coords(
+    preset: str | None,
+    coords: str | None,
+    coords_file: str | None,
+    coords_percent: str | None,
+    width: int,
+    height: int,
+    max_bbox_percent: float,
+) -> tuple[Image.Image | None, list[list[int]]]:
+    """Get mask from preset image or coordinates.
+
+    Returns:
+        Tuple of (mask, bboxes). If preset mask loaded, bboxes will be empty.
+        If mask is None, bboxes contains the parsed coordinates.
+    """
+    # Try loading preset mask first
+    if preset:
+        mask = load_preset_mask(preset, width, height)
+        if mask is not None:
+            return mask, []
+
+    # Fall back to coordinates
+    try:
+        bboxes = parse_coords(coords, coords_file, coords_percent, preset, width, height)
+    except Exception as e:
+        logger.error(f"Failed to parse coordinates: {e}")
+        return None, []
+
+    bboxes = validate_bboxes(bboxes, width, height, max_bbox_percent)
+    if not bboxes:
+        logger.error("No valid coordinates provided")
+        return None, []
+
+    return None, bboxes
+
+
 def _process_fixed_coords_single(
     input_path: Path,
     output_path: Path,
@@ -1284,21 +1373,20 @@ def _process_fixed_coords_single(
     force_format: str | None,
     overwrite: bool,
 ) -> Path | None:
-    """Process a single file with fixed coordinates."""
+    """Process a single file with fixed coordinates or preset mask."""
     width, height = get_media_dimensions(input_path)
 
-    try:
-        bboxes = parse_coords(coords, coords_file, coords_percent, preset, width, height)
-    except Exception as e:
-        logger.error(f"Failed to parse coordinates: {e}")
+    mask, bboxes = _get_mask_for_preset_or_coords(
+        preset, coords, coords_file, coords_percent, width, height, max_bbox_percent
+    )
+
+    # If no mask from preset, create from bboxes
+    if mask is None and not bboxes:
         return None
 
-    bboxes = validate_bboxes(bboxes, width, height, max_bbox_percent)
-    if not bboxes:
-        logger.error("No valid coordinates provided")
-        return None
-
-    logger.info(f"Using {len(bboxes)} watermark region(s): {bboxes}")
+    if mask is None:
+        logger.info(f"Using {len(bboxes)} watermark region(s): {bboxes}")
+        mask = create_mask_from_bboxes(bboxes, width, height)
 
     output_file = output_path / input_path.name if output_path.is_dir() else output_path
 
@@ -1307,11 +1395,12 @@ def _process_fixed_coords_single(
 
     if is_video_file(input_path):
         output_file = ensure_video_extension(output_file, force_format)
-        return process_video_fixed_coords(input_path, output_file, bboxes, model_manager, transparent, force_format)
+        return process_video_fixed_coords(
+            input_path, output_file, bboxes, model_manager, transparent, force_format, preset_mask=mask
+        )
 
     # Process image
     image = Image.open(input_path).convert("RGB")
-    mask = create_mask_from_bboxes(bboxes, width, height)
     result_image = inpaint_image(image, mask, model_manager, transparent)
 
     output_format = resolve_output_format(input_path, force_format, transparent)
@@ -1333,7 +1422,7 @@ def _process_fixed_coords_batch(
     max_bbox_percent: float,
     force_format: str | None,
 ) -> None:
-    """Process multiple files with fixed coordinates."""
+    """Process multiple files with fixed coordinates or preset mask."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     files = collect_media_files(input_dir)
@@ -1342,16 +1431,16 @@ def _process_fixed_coords_batch(
     for idx, file_path in enumerate(tqdm.tqdm(files, desc="Processing files (fixed coords)")):
         width, height = get_media_dimensions(file_path)
 
-        try:
-            bboxes = parse_coords(coords, coords_file, coords_percent, preset, width, height)
-        except Exception as e:
-            logger.warning(f"Failed to parse coordinates for {file_path}: {e}")
+        mask, bboxes = _get_mask_for_preset_or_coords(
+            preset, coords, coords_file, coords_percent, width, height, max_bbox_percent
+        )
+
+        if mask is None and not bboxes:
+            logger.warning(f"No valid mask or coordinates for {file_path}, skipping")
             continue
 
-        bboxes = validate_bboxes(bboxes, width, height, max_bbox_percent)
-        if not bboxes:
-            logger.warning(f"No valid coordinates for {file_path}, skipping")
-            continue
+        if mask is None:
+            mask = create_mask_from_bboxes(bboxes, width, height)
 
         progress_offset = int(idx / total_files * 100)
         progress_scale = int(100 / total_files)
@@ -1368,10 +1457,10 @@ def _process_fixed_coords_batch(
                 force_format,
                 progress_offset,
                 progress_scale,
+                preset_mask=mask,
             )
         else:
             image = Image.open(file_path).convert("RGB")
-            mask = create_mask_from_bboxes(bboxes, width, height)
             result_image = inpaint_image(image, mask, model_manager, transparent)
 
             output_format = resolve_output_format(file_path, force_format, transparent)
