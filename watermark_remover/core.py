@@ -265,11 +265,82 @@ def make_region_transparent(image: Image.Image, mask: Image.Image) -> Image.Imag
 
 
 VIDEO_EXTENSIONS = frozenset({".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm"})
+IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+
+# Output format dispatch tables
+FORMAT_TO_PIL: dict[str, str] = {"JPG": "JPEG", "JPEG": "JPEG", "PNG": "PNG", "WEBP": "WEBP"}
+FORMAT_SUPPORTS_TRANSPARENCY: frozenset[str] = frozenset({"PNG", "WEBP"})
 
 
 def is_video_file(file_path: str | Path) -> bool:
     """Check if the file is a video based on its extension."""
     return Path(file_path).suffix.lower() in VIDEO_EXTENSIONS
+
+
+def is_image_file(file_path: str | Path) -> bool:
+    """Check if the file is a supported image based on its extension."""
+    return Path(file_path).suffix.lower() in IMAGE_EXTENSIONS
+
+
+def get_media_dimensions(file_path: Path) -> tuple[int, int]:
+    """Get width and height of an image or video file."""
+    if is_video_file(file_path):
+        cap = cv2.VideoCapture(str(file_path))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+    else:
+        with Image.open(file_path) as img:
+            width, height = img.size
+    return width, height
+
+
+def resolve_output_format(
+    input_path: Path,
+    force_format: str | None,
+    transparent: bool,
+) -> str:
+    """Determine output format for image processing.
+
+    Returns PIL-compatible format string (e.g., "JPEG", "PNG", "WEBP").
+    """
+    if force_format:
+        fmt = force_format.upper()
+    elif transparent:
+        return "PNG"
+    else:
+        fmt = input_path.suffix[1:].upper()
+
+    # Normalize and validate
+    pil_format = FORMAT_TO_PIL.get(fmt, "PNG")
+
+    # JPEG doesn't support transparency
+    if transparent and pil_format not in FORMAT_SUPPORTS_TRANSPARENCY:
+        logger.warning(f"{pil_format} doesn't support transparency. Using PNG.")
+        return "PNG"
+
+    return pil_format
+
+
+def collect_media_files(directory: Path) -> list[Path]:
+    """Collect all supported image and video files from a directory."""
+    images = list(directory.glob("*.[jp][pn]g")) + list(directory.glob("*.webp"))
+    videos = (
+        list(directory.glob("*.mp4"))
+        + list(directory.glob("*.avi"))
+        + list(directory.glob("*.mov"))
+        + list(directory.glob("*.mkv"))
+    )
+    return images + videos
+
+
+def ensure_video_extension(output_path: Path, force_format: str | None) -> Path:
+    """Ensure video output has a valid video extension."""
+    if output_path.suffix.lower() in [".mp4", ".avi", ".mov", ".mkv"]:
+        return output_path
+    if force_format and force_format.upper() in ["MP4", "AVI"]:
+        return output_path.with_suffix(f".{force_format.lower()}")
+    return output_path.with_suffix(".mp4")
 
 
 def has_audio_stream(file_path: str | Path) -> bool:
@@ -453,6 +524,46 @@ def create_mask_from_bboxes(bboxes: list[list[int]], width: int, height: int) ->
         draw.rectangle([x1, y1, x2, y2], fill=255)
 
     return mask
+
+
+def inpaint_image(
+    image: Image.Image,
+    mask: Image.Image,
+    model_manager: ModelManager | None,
+    transparent: bool,
+) -> Image.Image:
+    """Apply watermark removal to an image using mask.
+
+    Args:
+        image: Input PIL Image (RGB)
+        mask: Mask image (L mode, 255=watermark)
+        model_manager: LaMA model (required if transparent=False)
+        transparent: If True, make regions transparent; else inpaint
+
+    Returns:
+        Processed PIL Image
+    """
+    if transparent:
+        return make_region_transparent(image, mask)
+
+    lama_result = process_image_with_lama(np.array(image), np.array(mask), model_manager)
+    return Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
+
+
+def save_image(
+    image: Image.Image,
+    output_path: Path,
+    output_format: str,
+) -> Path:
+    """Save image with correct format and extension.
+
+    Returns the actual path used (with corrected extension if needed).
+    """
+    # Ensure extension matches format
+    ext = "jpg" if output_format == "JPEG" else output_format.lower()
+    final_path = output_path.with_suffix(f".{ext}")
+    image.save(final_path, format=output_format)
+    return final_path
 
 
 def _get_video_fourcc(output_format: str) -> int:
@@ -1009,6 +1120,23 @@ def process_video_fixed_coords(
     return output_file
 
 
+def check_overwrite_safety(input_path: Path, output_path: Path, overwrite: bool) -> bool:
+    """Check if it's safe to write to output path.
+
+    Returns True if safe to proceed, False if should skip.
+    """
+    if input_path.resolve() == output_path.resolve():
+        logger.error(f"Cannot overwrite input file: {input_path}. Choose a different output path.")
+        print("ERROR: Cannot overwrite input file! Choose a different output folder.")
+        return False
+
+    if output_path.exists() and not overwrite:
+        logger.info(f"Skipping existing file: {output_path}")
+        return False
+
+    return True
+
+
 def handle_one(
     image_path: Path,
     output_path: Path,
@@ -1027,39 +1155,13 @@ def handle_one(
     progress_offset: int = 0,
     progress_scale: int = 100,
 ) -> Path | None:
-    """Process a single image or video file."""
-    # SAFETY: Never overwrite the input file
-    if image_path.resolve() == output_path.resolve():
-        logger.error(f"Cannot overwrite input file: {image_path}. Choose a different output path.")
-        print("ERROR: Cannot overwrite input file! Choose a different output folder.")
+    """Process a single image or video file with AI detection."""
+    if not check_overwrite_safety(image_path, output_path, overwrite):
         return None
 
-    if output_path.exists() and not overwrite:
-        logger.info(f"Skipping existing file: {output_path}")
-        return None
-
-    # Handle video files
+    # Dispatch: video vs image processing
     if is_video_file(image_path):
-        use_two_pass = detection_skip > 1 or fade_in > 0 or fade_out > 0
-        if use_two_pass:
-            return process_video_two_pass(
-                image_path,
-                output_path,
-                florence_model,
-                florence_processor,
-                model_manager,
-                device,
-                transparent,
-                max_bbox_percent,
-                force_format,
-                detection_prompt,
-                detection_skip,
-                fade_in,
-                fade_out,
-                progress_offset,
-                progress_scale,
-            )
-        return process_video(
+        return _handle_video_detection(
             image_path,
             output_path,
             florence_model,
@@ -1070,45 +1172,466 @@ def handle_one(
             max_bbox_percent,
             force_format,
             detection_prompt,
+            detection_skip,
+            fade_in,
+            fade_out,
             progress_offset,
             progress_scale,
         )
 
-    # Process image
-    image = Image.open(image_path).convert("RGB")
-    mask_image = get_watermark_mask(
-        image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt
+    return _handle_image_detection(
+        image_path,
+        output_path,
+        florence_model,
+        florence_processor,
+        model_manager,
+        device,
+        transparent,
+        max_bbox_percent,
+        force_format,
+        detection_prompt,
+        progress_offset,
+        progress_scale,
     )
 
-    if transparent:
-        result_image = make_region_transparent(image, mask_image)
-    else:
-        lama_result = process_image_with_lama(np.array(image), np.array(mask_image), model_manager)
-        result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
 
-    # Determine output format
-    if force_format:
-        output_format = force_format.upper()
-    elif transparent:
-        output_format = "PNG"
-    else:
-        output_format = image_path.suffix[1:].upper()
-        if output_format not in ("PNG", "WEBP", "JPG"):
-            output_format = "PNG"
+def _handle_video_detection(
+    image_path: Path,
+    output_path: Path,
+    florence_model: Florence2ForConditionalGeneration,
+    florence_processor: AutoProcessor,
+    model_manager: ModelManager | None,
+    device: str,
+    transparent: bool,
+    max_bbox_percent: float,
+    force_format: str | None,
+    detection_prompt: str,
+    detection_skip: int,
+    fade_in: float,
+    fade_out: float,
+    progress_offset: int,
+    progress_scale: int,
+) -> Path | None:
+    """Process video with AI watermark detection."""
+    use_two_pass = detection_skip > 1 or fade_in > 0 or fade_out > 0
 
-    # Map JPG to JPEG for PIL compatibility
-    if output_format == "JPG":
-        output_format = "JPEG"
+    process_fn = process_video_two_pass if use_two_pass else process_video
+    kwargs = {
+        "input_path": image_path,
+        "output_path": output_path,
+        "florence_model": florence_model,
+        "florence_processor": florence_processor,
+        "model_manager": model_manager,
+        "device": device,
+        "transparent": transparent,
+        "max_bbox_percent": max_bbox_percent,
+        "force_format": force_format,
+        "detection_prompt": detection_prompt,
+        "progress_offset": progress_offset,
+        "progress_scale": progress_scale,
+    }
 
-    if transparent and output_format == "JPEG":
-        logger.warning("Transparency requested but JPEG doesn't support it. Using PNG.")
-        output_format = "PNG"
+    if use_two_pass:
+        kwargs["detection_skip"] = detection_skip
+        kwargs["fade_in_sec"] = fade_in
+        kwargs["fade_out_sec"] = fade_out
 
-    new_output_path = output_path.with_suffix(f".{output_format.lower()}")
-    result_image.save(new_output_path, format=output_format)
+    return process_fn(**kwargs)
+
+
+def _handle_image_detection(
+    image_path: Path,
+    output_path: Path,
+    florence_model: Florence2ForConditionalGeneration,
+    florence_processor: AutoProcessor,
+    model_manager: ModelManager | None,
+    device: str,
+    transparent: bool,
+    max_bbox_percent: float,
+    force_format: str | None,
+    detection_prompt: str,
+    progress_offset: int,
+    progress_scale: int,
+) -> Path | None:
+    """Process image with AI watermark detection."""
+    image = Image.open(image_path).convert("RGB")
+    mask = get_watermark_mask(image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
+
+    result_image = inpaint_image(image, mask, model_manager, transparent)
+    output_format = resolve_output_format(image_path, force_format, transparent)
+    final_path = save_image(result_image, output_path, output_format)
+
     final_progress = progress_offset + progress_scale
-    print(f"input_path:{image_path}, output_path:{new_output_path}, overall_progress:{final_progress}%")
-    return new_output_path
+    print(f"input_path:{image_path}, output_path:{final_path}, overall_progress:{final_progress}%")
+    return final_path
+
+
+# =============================================================================
+# PROCESSING MODE HANDLERS
+# =============================================================================
+
+
+def _process_fixed_coords_single(
+    input_path: Path,
+    output_path: Path,
+    coords: str | None,
+    coords_file: str | None,
+    coords_percent: str | None,
+    preset: str | None,
+    model_manager: ModelManager | None,
+    transparent: bool,
+    max_bbox_percent: float,
+    force_format: str | None,
+    overwrite: bool,
+) -> Path | None:
+    """Process a single file with fixed coordinates."""
+    width, height = get_media_dimensions(input_path)
+
+    try:
+        bboxes = parse_coords(coords, coords_file, coords_percent, preset, width, height)
+    except Exception as e:
+        logger.error(f"Failed to parse coordinates: {e}")
+        return None
+
+    bboxes = validate_bboxes(bboxes, width, height, max_bbox_percent)
+    if not bboxes:
+        logger.error("No valid coordinates provided")
+        return None
+
+    logger.info(f"Using {len(bboxes)} watermark region(s): {bboxes}")
+
+    output_file = output_path / input_path.name if output_path.is_dir() else output_path
+
+    if not check_overwrite_safety(input_path, output_file, overwrite):
+        return None
+
+    if is_video_file(input_path):
+        output_file = ensure_video_extension(output_file, force_format)
+        return process_video_fixed_coords(input_path, output_file, bboxes, model_manager, transparent, force_format)
+
+    # Process image
+    image = Image.open(input_path).convert("RGB")
+    mask = create_mask_from_bboxes(bboxes, width, height)
+    result_image = inpaint_image(image, mask, model_manager, transparent)
+
+    output_format = resolve_output_format(input_path, force_format, transparent)
+    output_file = save_image(result_image, output_file, output_format)
+
+    print(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")
+    return output_file
+
+
+def _process_fixed_coords_batch(
+    input_dir: Path,
+    output_dir: Path,
+    coords: str | None,
+    coords_file: str | None,
+    coords_percent: str | None,
+    preset: str | None,
+    model_manager: ModelManager | None,
+    transparent: bool,
+    max_bbox_percent: float,
+    force_format: str | None,
+) -> None:
+    """Process multiple files with fixed coordinates."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    files = collect_media_files(input_dir)
+    total_files = len(files)
+
+    for idx, file_path in enumerate(tqdm.tqdm(files, desc="Processing files (fixed coords)")):
+        width, height = get_media_dimensions(file_path)
+
+        try:
+            bboxes = parse_coords(coords, coords_file, coords_percent, preset, width, height)
+        except Exception as e:
+            logger.warning(f"Failed to parse coordinates for {file_path}: {e}")
+            continue
+
+        bboxes = validate_bboxes(bboxes, width, height, max_bbox_percent)
+        if not bboxes:
+            logger.warning(f"No valid coordinates for {file_path}, skipping")
+            continue
+
+        progress_offset = int(idx / total_files * 100)
+        progress_scale = int(100 / total_files)
+        output_file = output_dir / file_path.name
+
+        if is_video_file(file_path):
+            output_file = ensure_video_extension(output_file, force_format)
+            process_video_fixed_coords(
+                file_path,
+                output_file,
+                bboxes,
+                model_manager,
+                transparent,
+                force_format,
+                progress_offset,
+                progress_scale,
+            )
+        else:
+            image = Image.open(file_path).convert("RGB")
+            mask = create_mask_from_bboxes(bboxes, width, height)
+            result_image = inpaint_image(image, mask, model_manager, transparent)
+
+            output_format = resolve_output_format(file_path, force_format, transparent)
+            output_file = save_image(result_image, output_file, output_format)
+            print(
+                f"input_path:{file_path}, output_path:{output_file}, overall_progress:{progress_offset + progress_scale}%"
+            )
+
+
+def _process_fixed_coords(
+    input_path: Path,
+    output_path: Path,
+    coords: str | None,
+    coords_file: str | None,
+    coords_percent: str | None,
+    preset: str | None,
+    transparent: bool,
+    max_bbox_percent: float,
+    force_format: str | None,
+    overwrite: bool,
+) -> Path | None:
+    """Process files with fixed watermark coordinates (no AI detection)."""
+    logger.info("Using fixed coordinates mode (no AI detection)")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    model_manager = load_lama_model(device) if not transparent else None
+    if model_manager:
+        logger.info("LaMa model loaded")
+
+    if input_path.is_dir():
+        _process_fixed_coords_batch(
+            input_path,
+            output_path,
+            coords,
+            coords_file,
+            coords_percent,
+            preset,
+            model_manager,
+            transparent,
+            max_bbox_percent,
+            force_format,
+        )
+        return None
+
+    return _process_fixed_coords_single(
+        input_path,
+        output_path,
+        coords,
+        coords_file,
+        coords_percent,
+        preset,
+        model_manager,
+        transparent,
+        max_bbox_percent,
+        force_format,
+        overwrite,
+    )
+
+
+def _process_preview(
+    input_path: Path,
+    max_bbox_percent: float,
+    detection_prompt: str,
+) -> None:
+    """Run preview mode - detect watermarks and output JSON."""
+    import base64
+    import json as json_module
+    import random
+    from io import BytesIO
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    florence_model = (
+        Florence2ForConditionalGeneration.from_pretrained("florence-community/Florence-2-large").to(device).eval()
+    )
+    florence_processor = AutoProcessor.from_pretrained("florence-community/Florence-2-large")
+
+    # Get sample image
+    if input_path.is_dir():
+        files = collect_media_files(input_path)
+        if not files:
+            print(json_module.dumps({"error": "No supported files found in directory"}))
+            return
+        sample_path = random.choice(files)
+    else:
+        sample_path = input_path
+
+    # Load image (extract frame if video)
+    if is_video_file(sample_path):
+        cap = cv2.VideoCapture(str(sample_path))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames // 2)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            print(json_module.dumps({"error": f"Could not read frame from video: {sample_path}"}))
+            return
+        pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        source_type = "video"
+        source_frame = total_frames // 2
+    else:
+        pil_image = Image.open(sample_path).convert("RGB")
+        source_type = "image"
+        source_frame = None
+
+    # Run detection
+    detections = detect_only(pil_image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
+
+    # Draw bounding boxes
+    draw = ImageDraw.Draw(pil_image)
+    for det in detections:
+        x1, y1, x2, y2 = det["bbox"]
+        color = (0, 255, 0) if det["accepted"] else (255, 0, 0)
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+        draw.text((x1, y1 - 15), f"{det['area_percent']:.1f}%", fill=color)
+
+    # Convert to base64
+    buffer = BytesIO()
+    pil_image.save(buffer, format="PNG")
+    img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    result: PreviewResult = {
+        "image": img_base64,
+        "detections": detections,
+        "source": str(sample_path),
+        "source_type": source_type,
+        "source_frame": source_frame,
+        "prompt_used": detection_prompt,
+        "max_bbox_percent": max_bbox_percent,
+    }
+    print(json_module.dumps(result))
+
+
+def _process_detection(
+    input_path: Path,
+    output_path: Path,
+    transparent: bool,
+    max_bbox_percent: float,
+    force_format: str | None,
+    overwrite: bool,
+    detection_prompt: str,
+    detection_skip: int,
+    fade_in: float,
+    fade_out: float,
+) -> Path | None:
+    """Process files with AI watermark detection."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    florence_model = (
+        Florence2ForConditionalGeneration.from_pretrained("florence-community/Florence-2-large").to(device).eval()
+    )
+    florence_processor = AutoProcessor.from_pretrained("florence-community/Florence-2-large")
+    logger.info("Florence-2 Model loaded")
+
+    model_manager = load_lama_model(device) if not transparent else None
+    if model_manager:
+        logger.info("LaMa model loaded")
+
+    # Batch processing
+    if input_path.is_dir():
+        output_path.mkdir(parents=True, exist_ok=True)
+        files = collect_media_files(input_path)
+        total_files = len(files)
+
+        for idx, file_path in enumerate(tqdm.tqdm(files, desc="Processing files")):
+            progress_offset = int(idx / total_files * 100)
+            progress_scale = int(100 / total_files)
+            output_file = output_path / file_path.name
+
+            handle_one(
+                file_path,
+                output_file,
+                florence_model,
+                florence_processor,
+                model_manager,
+                device,
+                transparent,
+                max_bbox_percent,
+                force_format,
+                overwrite,
+                detection_prompt,
+                detection_skip,
+                fade_in,
+                fade_out,
+                progress_offset,
+                progress_scale,
+            )
+        return None
+
+    # Single file processing
+    output_file = output_path / input_path.name if output_path.is_dir() else output_path
+
+    if is_video_file(input_path):
+        output_file = ensure_video_extension(output_file, force_format)
+
+    result = handle_one(
+        input_path,
+        output_file,
+        florence_model,
+        florence_processor,
+        model_manager,
+        device,
+        transparent,
+        max_bbox_percent,
+        force_format,
+        overwrite,
+        detection_prompt,
+        detection_skip,
+        fade_in,
+        fade_out,
+    )
+    print(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")
+    return result
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+
+def _validate_inputs(
+    detection_skip: int,
+    fade_in: float,
+    fade_out: float,
+    preset: str | None,
+    coords: str | None,
+    coords_file: str | None,
+    coords_percent: str | None,
+    preview: bool,
+) -> tuple[int, float, float, bool] | None:
+    """Validate and normalize input parameters.
+
+    Returns (detection_skip, fade_in, fade_out, use_fixed_coords) or None if validation fails.
+    """
+    # Clamp values
+    if detection_skip < 1 or detection_skip > 10:
+        logger.warning(f"detection_skip must be 1-10, got {detection_skip}. Using 1.")
+        detection_skip = max(1, min(10, detection_skip))
+
+    fade_in = max(0.0, fade_in)
+    fade_out = max(0.0, fade_out)
+
+    # Check fixed coords mode
+    coord_options = [preset, coords, coords_file, coords_percent]
+    use_fixed_coords = any(coord_options)
+
+    # Validate mutually exclusive options
+    if sum(1 for opt in coord_options if opt) > 1:
+        logger.error(
+            "Cannot use multiple coordinate options together. Choose one of: --preset, --coords, --coords-file, --coords-percent"
+        )
+        return None
+
+    if use_fixed_coords and preview:
+        logger.error("Preview mode is not supported with fixed coordinates")
+        return None
+
+    return detection_skip, fade_in, fade_out, use_fixed_coords
 
 
 def process(
@@ -1128,375 +1651,51 @@ def process(
     coords_file: str | None = None,
     coords_percent: str | None = None,
 ) -> Path | None:
-    """Main processing function - called by CLI."""
-    # Input validation
-    if detection_skip < 1 or detection_skip > 10:
-        logger.warning(f"detection_skip must be 1-10, got {detection_skip}. Using 1.")
-        detection_skip = max(1, min(10, detection_skip))
-    if fade_in < 0:
-        fade_in = 0
-    if fade_out < 0:
-        fade_out = 0
+    """Main processing function - called by CLI.
 
-    input_path = Path(input_path)
-
-    # Check if using fixed coordinates mode
-    use_fixed_coords = bool(preset or coords or coords_file or coords_percent)
-
-    # Validate mutually exclusive options
-    coord_options = [preset, coords, coords_file, coords_percent]
-    if sum(1 for opt in coord_options if opt) > 1:
-        logger.error(
-            "Cannot use multiple coordinate options together. Choose one of: --preset, --coords, --coords-file, --coords-percent"
-        )
-        return
-
-    if use_fixed_coords and preview:
-        logger.error("Preview mode is not supported with fixed coordinates")
-        return
-
-    # ========== FIXED COORDINATES MODE ==========
-    if use_fixed_coords:
-        logger.info("Using fixed coordinates mode (no AI detection)")
-        output_path = Path(output_path)
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Using device: {device}")
-
-        # Only load LaMA if not transparent mode
-        if not transparent:
-            model_manager = load_lama_model(device)
-            logger.info("LaMa model loaded")
-        else:
-            model_manager = None
-
-        # Handle single file
-        if not input_path.is_dir():
-            # Get dimensions for coordinate parsing
-            if is_video_file(input_path):
-                cap = cv2.VideoCapture(str(input_path))
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                cap.release()
-            else:
-                img = Image.open(input_path)
-                width, height = img.size
-                img.close()
-
-            # Parse and validate coordinates
-            try:
-                bboxes = parse_coords(coords, coords_file, coords_percent, preset, width, height)
-            except Exception as e:
-                logger.error(f"Failed to parse coordinates: {e}")
-                return
-
-            bboxes = validate_bboxes(bboxes, width, height, max_bbox_percent)
-            if not bboxes:
-                logger.error("No valid coordinates provided")
-                return
-
-            logger.info(f"Using {len(bboxes)} watermark region(s): {bboxes}")
-
-            # Ensure output path
-            if output_path.is_dir():
-                output_file = output_path / input_path.name
-            else:
-                output_file = output_path
-
-            # SAFETY: Never overwrite the input file
-            if input_path.resolve() == output_file.resolve():
-                logger.error(f"Cannot overwrite input file: {input_path}. Choose a different output path.")
-                return
-
-            if output_file.exists() and not overwrite:
-                logger.info(f"Skipping existing file: {output_file}")
-                return
-
-            if is_video_file(input_path):
-                # Ensure video output has proper extension
-                if output_file.suffix.lower() not in [".mp4", ".avi", ".mov", ".mkv"]:
-                    if force_format and force_format.upper() in ["MP4", "AVI"]:
-                        output_file = output_file.with_suffix(f".{force_format.lower()}")
-                    else:
-                        output_file = output_file.with_suffix(".mp4")
-                process_video_fixed_coords(input_path, output_file, bboxes, model_manager, transparent, force_format)
-            else:
-                # Process image with fixed coords
-                image = Image.open(input_path).convert("RGB")
-                mask = create_mask_from_bboxes(bboxes, width, height)
-
-                if transparent:
-                    result_image = make_region_transparent(image, mask)
-                else:
-                    lama_result = process_image_with_lama(np.array(image), np.array(mask), model_manager)
-                    result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
-
-                # Determine output format
-                if force_format:
-                    output_format = force_format.upper()
-                elif transparent:
-                    output_format = "PNG"
-                else:
-                    output_format = input_path.suffix[1:].upper()
-                    if output_format not in ["PNG", "WEBP", "JPG"]:
-                        output_format = "PNG"
-
-                if output_format == "JPG":
-                    output_format = "JPEG"
-
-                output_file = output_file.with_suffix(f".{output_format.lower()}")
-                result_image.save(output_file, format=output_format)
-
-            print(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")
-            return
-
-        # Handle directory with fixed coords
-        if not output_path.exists():
-            output_path.mkdir(parents=True)
-
-        images = list(input_path.glob("*.[jp][pn]g")) + list(input_path.glob("*.webp"))
-        videos = (
-            list(input_path.glob("*.mp4"))
-            + list(input_path.glob("*.avi"))
-            + list(input_path.glob("*.mov"))
-            + list(input_path.glob("*.mkv"))
-        )
-        files = images + videos
-        total_files = len(files)
-
-        for idx, file_path in enumerate(tqdm.tqdm(files, desc="Processing files (fixed coords)")):
-            output_file = output_path / file_path.name
-
-            # Get dimensions for this file
-            if is_video_file(file_path):
-                cap = cv2.VideoCapture(str(file_path))
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                cap.release()
-            else:
-                img = Image.open(file_path)
-                width, height = img.size
-                img.close()
-
-            # Parse and validate coordinates for this file's dimensions
-            try:
-                bboxes = parse_coords(coords, coords_file, coords_percent, preset, width, height)
-            except Exception as e:
-                logger.warning(f"Failed to parse coordinates for {file_path}: {e}")
-                continue
-
-            bboxes = validate_bboxes(bboxes, width, height, max_bbox_percent)
-            if not bboxes:
-                logger.warning(f"No valid coordinates for {file_path}, skipping")
-                continue
-
-            progress_offset = int(idx / total_files * 100)
-            progress_scale = int(100 / total_files)
-
-            if is_video_file(file_path):
-                if output_file.suffix.lower() not in [".mp4", ".avi"]:
-                    output_file = output_file.with_suffix(".mp4")
-                process_video_fixed_coords(
-                    file_path,
-                    output_file,
-                    bboxes,
-                    model_manager,
-                    transparent,
-                    force_format,
-                    progress_offset,
-                    progress_scale,
-                )
-            else:
-                image = Image.open(file_path).convert("RGB")
-                mask = create_mask_from_bboxes(bboxes, width, height)
-
-                if transparent:
-                    result_image = make_region_transparent(image, mask)
-                else:
-                    lama_result = process_image_with_lama(np.array(image), np.array(mask), model_manager)
-                    result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
-
-                if force_format:
-                    output_format = force_format.upper()
-                elif transparent:
-                    output_format = "PNG"
-                else:
-                    output_format = file_path.suffix[1:].upper()
-                    if output_format not in ["PNG", "WEBP", "JPG"]:
-                        output_format = "PNG"
-
-                if output_format == "JPG":
-                    output_format = "JPEG"
-
-                output_file = output_file.with_suffix(f".{output_format.lower()}")
-                result_image.save(output_file, format=output_format)
-                print(
-                    f"input_path:{file_path}, output_path:{output_file}, overall_progress:{progress_offset + progress_scale}%"
-                )
-
-        return
-
-    # ========== PREVIEW MODE ==========
-    if preview:
-        import base64
-        import json
-        import random
-        from io import BytesIO
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        florence_model = (
-            Florence2ForConditionalGeneration.from_pretrained("florence-community/Florence-2-large").to(device).eval()
-        )
-        florence_processor = AutoProcessor.from_pretrained("florence-community/Florence-2-large")
-
-        # Get sample image from input
-        if input_path.is_dir():
-            # Get a random image from directory
-            images = list(input_path.glob("*.[jp][pn]g")) + list(input_path.glob("*.webp"))
-            videos = list(input_path.glob("*.mp4")) + list(input_path.glob("*.avi")) + list(input_path.glob("*.mov"))
-            files = images + videos
-            if not files:
-                print(json.dumps({"error": "No supported files found in directory"}))
-                return
-            sample_path = random.choice(files)
-        else:
-            sample_path = input_path
-
-        # Load image (extract frame if video)
-        if is_video_file(sample_path):
-            cap = cv2.VideoCapture(str(sample_path))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            # Get frame from middle of video
-            cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames // 2)
-            ret, frame = cap.read()
-            cap.release()
-            if not ret:
-                print(json.dumps({"error": f"Could not read frame from video: {sample_path}"}))
-                return
-            pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            source_type = "video"
-            source_frame = total_frames // 2
-        else:
-            pil_image = Image.open(sample_path).convert("RGB")
-            source_type = "image"
-            source_frame = None
-
-        # Run detection
-        detections = detect_only(
-            pil_image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt
-        )
-
-        # Draw bounding boxes on image
-        draw = ImageDraw.Draw(pil_image)
-        for det in detections:
-            x1, y1, x2, y2 = det["bbox"]
-            color = (0, 255, 0) if det["accepted"] else (255, 0, 0)  # Green if accepted, red if rejected
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-            # Draw label
-            label = f"{det['area_percent']:.1f}%"
-            draw.text((x1, y1 - 15), label, fill=color)
-
-        # Convert to base64
-        buffer = BytesIO()
-        pil_image.save(buffer, format="PNG")
-        img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-        # Output JSON result
-        result = {
-            "image": img_base64,  # Just base64, GUI adds prefix
-            "detections": detections,
-            "source": str(sample_path),
-            "source_type": source_type,
-            "source_frame": source_frame,
-            "prompt_used": detection_prompt,
-            "max_bbox_percent": max_bbox_percent,
-        }
-        print(json.dumps(result))
-        return
-
-    # ========== NORMAL PROCESSING MODE ==========
-    output_path = Path(output_path)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    florence_model = (
-        Florence2ForConditionalGeneration.from_pretrained("florence-community/Florence-2-large").to(device).eval()
+    Dispatches to appropriate handler based on mode:
+    - Fixed coordinates mode: Uses preset or user-provided coordinates
+    - Preview mode: Detects watermarks and outputs JSON
+    - Detection mode: Uses AI to detect and remove watermarks
+    """
+    validated = _validate_inputs(
+        detection_skip, fade_in, fade_out, preset, coords, coords_file, coords_percent, preview
     )
-    florence_processor = AutoProcessor.from_pretrained("florence-community/Florence-2-large")
-    logger.info("Florence-2 Model loaded")
+    if validated is None:
+        return None
 
-    if not transparent:
-        model_manager = load_lama_model(device)
-        logger.info("LaMa model loaded")
-    else:
-        model_manager = None
+    detection_skip, fade_in, fade_out, use_fixed_coords = validated
+    input_path_obj = Path(input_path)
+    output_path_obj = Path(output_path) if output_path else None
 
-    if input_path.is_dir():
-        if not output_path.exists():
-            output_path.mkdir(parents=True)
-
-        # Include video files in the search
-        images = list(input_path.glob("*.[jp][pn]g")) + list(input_path.glob("*.webp"))
-        videos = (
-            list(input_path.glob("*.mp4"))
-            + list(input_path.glob("*.avi"))
-            + list(input_path.glob("*.mov"))
-            + list(input_path.glob("*.mkv"))
-        )
-        files = images + videos
-        total_files = len(files)
-
-        for idx, file_path in enumerate(tqdm.tqdm(files, desc="Processing files")):
-            output_file = output_path / file_path.name
-            # Calculate progress range for this file
-            progress_offset = int(idx / total_files * 100)
-            progress_scale = int(100 / total_files)
-            handle_one(
-                file_path,
-                output_file,
-                florence_model,
-                florence_processor,
-                model_manager,
-                device,
-                transparent,
-                max_bbox_percent,
-                force_format,
-                overwrite,
-                detection_prompt,
-                detection_skip,
-                fade_in,
-                fade_out,
-                progress_offset,
-                progress_scale,
-            )
-    else:
-        # Single file mode - if output is a directory, construct file path
-        if output_path.is_dir():
-            output_file = output_path / input_path.name
-        else:
-            output_file = output_path
-
-        # Ensure video output has proper extension
-        if is_video_file(input_path) and output_file.suffix.lower() not in [".mp4", ".avi", ".mov", ".mkv"]:
-            if force_format and force_format.upper() in ["MP4", "AVI"]:
-                output_file = output_file.with_suffix(f".{force_format.lower()}")
-            else:
-                output_file = output_file.with_suffix(".mp4")  # Default to mp4
-
-        handle_one(
-            input_path,
-            output_file,
-            florence_model,
-            florence_processor,
-            model_manager,
-            device,
+    # Dispatch to appropriate handler
+    if use_fixed_coords:
+        return _process_fixed_coords(
+            input_path_obj,
+            output_path_obj,
+            coords,
+            coords_file,
+            coords_percent,
+            preset,
             transparent,
             max_bbox_percent,
             force_format,
             overwrite,
-            detection_prompt,
-            detection_skip,
-            fade_in,
-            fade_out,
         )
-        print(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")
+
+    if preview:
+        _process_preview(input_path_obj, max_bbox_percent, detection_prompt)
+        return None
+
+    return _process_detection(
+        input_path_obj,
+        output_path_obj,
+        transparent,
+        max_bbox_percent,
+        force_format,
+        overwrite,
+        detection_prompt,
+        detection_skip,
+        fade_in,
+        fade_out,
+    )
