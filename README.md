@@ -56,19 +56,18 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ### Setup
 
 ```bash
-git clone https://github.com/D-Ogi/WatermarkRemover-AI.git
-cd WatermarkRemover-AI
-./setup.sh      # Linux/macOS
-.\setup.bat     # Windows
+uv tool install git+https://github.com/D-Ogi/WatermarkRemover-AI.git
+watermark-remover setup
 ```
 
-The setup wizard will:
+The setup wizard will automatically:
 
-- Install Python and dependencies via uv
+- Install Python 3.12+ and dependencies
+- Detect GPU (CUDA) or use CPU fallback
 - Download AI models (~1.7GB total)
-- Offer to launch the app when complete
+- Use China mirrors if zh_CN locale detected (or use `--china` flag)
 
-After setup, use `run.bat` (Windows) or `./run.sh` (Linux/macOS) to launch.
+After setup, launch with `watermark-remover gui`.
 
 ### Optional: FFmpeg
 
@@ -84,7 +83,7 @@ Install FFmpeg to preserve audio when processing videos:
 
 ### GUI Mode
 
-1. Run the app (`run.bat` on Windows, `./run.sh` on macOS/Linux)
+1. Run the app with `watermark-remover gui`
 2. Select your preferred language and theme from the top-right corner
 3. Select your mode (Single File or Batch)
 4. Set input and output paths
@@ -97,22 +96,22 @@ Your settings are automatically saved and restored on next launch.
 
 ```bash
 # Basic usage
-uv run watermark-remover remove input.png output_folder/
+watermark-remover remove input.png output_folder/
 
 # With options
-uv run watermark-remover remove ./images ./output --overwrite --max-bbox-percent=15 --force-format=PNG
+watermark-remover remove ./images ./output --overwrite --max-bbox-percent=15 --force-format=PNG
 
 # Process video with two-pass detection
-uv run watermark-remover remove video.mp4 ./output --detection-skip=3 --fade-in=0.5 --fade-out=0.5
+watermark-remover remove video.mp4 ./output --detection-skip=3 --fade-in=0.5 --fade-out=0.5
 
 # Preview mode (detect without processing)
-uv run watermark-remover remove input.png --preview
+watermark-remover remove input.png --preview
 
 # Run setup wizard
-uv run watermark-remover setup
+watermark-remover setup
 
 # Launch GUI directly
-uv run watermark-remover gui
+watermark-remover gui
 ```
 
 ### CLI Options

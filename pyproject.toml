@@ -3,7 +3,7 @@ name = "watermarkremover-ai"
 version = "1.0.0"
 description = "AI-powered watermark removal using Florence-2 detection and LaMA inpainting"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     # AI/ML core
     "torch>=2.4.0",
@@ -74,15 +74,15 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = [
-    "E",      # pycodestyle errors
-    "W",      # pycodestyle warnings
-    "F",      # pyflakes
-    "I",      # isort
-    "B",      # flake8-bugbear
-    "UP",     # pyupgrade
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "B",  # flake8-bugbear
+    "UP", # pyupgrade
 ]
 ignore = [
-    "E501",   # line too long (handled by formatter)
+    "E501", # line too long (handled by formatter)
 ]
 
 [tool.ruff.format]

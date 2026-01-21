@@ -9,8 +9,6 @@ import time
 import urllib.request
 from pathlib import Path
 
-PYTHON_VERSION = "3.12"
-
 # China mirror configuration
 CHINA_PYPI_MIRROR = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 CHINA_HF_MIRROR = "https://hf-mirror.com"
@@ -77,6 +75,22 @@ def detect_platform() -> str:
         return "linux"
 
 
+def detect_china_locale() -> bool:
+    """Auto-detect if user is likely in China based on timezone or locale."""
+    try:
+        # Check timezone
+        if time.timezone == -28800 or time.altzone == -28800:  # UTC+8
+            # Could be China, but also Singapore, HK, etc.
+            # Check locale for more confidence
+            import locale
+            lang = locale.getdefaultlocale()[0] or ""
+            if lang.startswith("zh_CN"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def detect_nvidia_gpu() -> bool:
     """Detect if an NVIDIA GPU is available."""
     if detect_platform() == "macos":
@@ -126,24 +140,6 @@ def print_warning(text: str):
 def print_info(text: str):
     """Print an info message."""
     print(f"  {Colors.CYAN}[*]{Colors.RESET} {text}")
-
-
-def print_question(text: str):
-    """Print a question."""
-    print(f"  {Colors.YELLOW}[?]{Colors.RESET} {text}")
-
-
-def ask_yes_no(prompt: str, default: bool = False) -> bool:
-    """Ask a yes/no question."""
-    hint = "(Y/n)" if default else "(y/N)"
-    try:
-        response = input(f"      {prompt} {hint}: ").strip().lower()
-        if not response:
-            return default
-        return response in ("y", "yes")
-    except (KeyboardInterrupt, EOFError):
-        print()
-        return default
 
 
 def show_rotating_tips(stop_event: threading.Event, tip_index: list):
@@ -225,7 +221,7 @@ def sync_dependencies(china_mode: bool, use_cpu: bool) -> bool:
     if use_cpu:
         env["UV_EXTRA_INDEX_URL"] = "https://download.pytorch.org/whl/cpu"
 
-    args = ["uv", "sync", "--python", PYTHON_VERSION]
+    args = ["uv", "sync"]
     return run_command_with_tips(args, env=env) == 0
 
 
@@ -314,7 +310,7 @@ def set_console_title(title: str):
             pass
 
 
-def run_setup(china_mode: bool = False, interactive: bool = True):
+def run_setup(china_mode: bool = False):
     """Run the full setup wizard."""
     Colors.init()
     set_console_title("WatermarkRemover-AI Setup")
@@ -324,12 +320,9 @@ def run_setup(china_mode: bool = False, interactive: bool = True):
     platform = detect_platform()
     print_info(f"Detected platform: {platform}")
 
-    # Ask about China mirrors if interactive and not already set
-    if interactive and not china_mode:
-        print()
-        print_question("Are you in China? (y/n)")
-        print(f"      {Colors.GRAY}This will use faster mirrors for downloads{Colors.RESET}")
-        china_mode = ask_yes_no("", default=False)
+    # Auto-detect China locale if not explicitly set
+    if not china_mode:
+        china_mode = detect_china_locale()
 
     if china_mode:
         print_ok("Using China mirrors (Tsinghua PyPI + HF-Mirror)")
@@ -358,8 +351,6 @@ def run_setup(china_mode: bool = False, interactive: bool = True):
     if not sync_dependencies(china_mode, use_cpu):
         print()
         print_error("Failed to install dependencies")
-        if interactive and platform == "windows":
-            input("  Press Enter to exit")
         sys.exit(1)
 
     print_ok("Dependencies installed")
@@ -368,8 +359,6 @@ def run_setup(china_mode: bool = False, interactive: bool = True):
     print_info("Installing iopaint (no deps)...")
     if not install_iopaint(china_mode):
         print_error("Failed to install iopaint")
-        if interactive and platform == "windows":
-            input("  Press Enter to exit")
         sys.exit(1)
     print_ok("iopaint installed")
 
@@ -377,8 +366,6 @@ def run_setup(china_mode: bool = False, interactive: bool = True):
     print_info("Verifying installation...")
     if not verify_installation():
         print_error("Verification failed")
-        if interactive and platform == "windows":
-            input("  Press Enter to exit")
         sys.exit(1)
     print_ok("All dependencies verified")
 
@@ -394,26 +381,10 @@ def run_setup(china_mode: bool = False, interactive: bool = True):
     # Success
     print_header("Setup complete! Ready to go!")
 
-    if platform == "windows":
-        print(f"  To run the app: Double-click {Colors.WHITE}run.bat{Colors.RESET}")
-    else:
-        print(f"  To run the app: {Colors.WHITE}./run.sh{Colors.RESET}")
-    print()
-
-    # Ask to launch
-    if interactive:
-        print_question("Launch now? (y/n)")
-        if ask_yes_no("", default=False):
-            print()
-            print_info("Starting WatermarkRemover-AI...")
-            subprocess.run(["uv", "run", "watermark-remover", "gui"])
-
+    print(f"  To run the app: {Colors.WHITE}uv run watermark-remover gui{Colors.RESET}")
     print()
     print(f"  {Colors.MAGENTA}Have fun yeeting watermarks!{Colors.RESET}")
     print()
-
-    if interactive and platform == "windows":
-        input("  Press Enter to exit")
 
 
 if __name__ == "__main__":
