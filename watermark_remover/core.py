@@ -631,15 +631,13 @@ def process_video_two_pass(input_path, output_path, florence_model, florence_pro
             logger.warning("FFmpeg is not available. Video will be produced without audio.")
             shutil.copy(str(temp_video_path), str(output_file))
         else:
-            # Re-encode with H.264 for better compression (mp4v from OpenCV is bloated)
+            # Copy streams without re-encoding
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
                 "-i", str(temp_video_path),
                 "-i", str(input_path),
-                "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "18",  # High quality (lower = better, 18-23 is visually lossless)
-                "-c:a", "aac",
+                "-c:v", "copy",  # Copy video stream (already encoded by OpenCV)
+                "-c:a", "copy",  # Copy audio stream from original
                 "-map", "0:v:0",
                 "-map", "1:a:0?",  # ? makes audio optional
                 "-shortest",
@@ -744,13 +742,13 @@ def process_video_fixed_coords(input_path, output_path, bboxes, model_manager, t
             "-i", "-",  # stdin
             # Input 2: original file for audio
             "-i", str(input_path),
-            # Video encoding
+            # Video encoding (must encode - receiving raw frames)
             "-c:v", "libx264",
             "-preset", "medium",
             "-crf", "18",
             "-pix_fmt", "yuv420p",
-            # Audio (copy from original)
-            "-c:a", "aac",
+            # Audio (copy from original without re-encoding)
+            "-c:a", "copy",
             "-map", "0:v:0",
             "-map", "1:a:0?",
             "-shortest",
