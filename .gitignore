@@ -53,3 +53,5 @@ Thumbs.db
 *.safetensors
 .cache/
 huggingface/
+/test_assets
+/tests_output

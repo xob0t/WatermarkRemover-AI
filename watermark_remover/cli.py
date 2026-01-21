@@ -53,6 +53,27 @@ def setup() -> None:
 @click.option("--coords", default=None, type=str, help="Watermark bbox as JSON: [x1,y1,x2,y2]. Bypasses AI detection.")
 @click.option("--coords-file", default=None, type=click.Path(exists=True), help="JSON file with watermark coordinates.")
 @click.option("--coords-percent", default=None, type=str, help="Coordinates as percentages (0-100): [x1,y1,x2,y2].")
+@click.option(
+    "--quality",
+    type=click.Choice(["fast", "balanced", "high"], case_sensitive=False),
+    default=None,
+    help="Quality preset: fast (25 steps), balanced (50 steps), high (100 steps).",
+)
+@click.option("--ldm-steps", default=None, type=int, help="Inpainting steps (25-100). Overrides --quality.")
+@click.option(
+    "--ldm-sampler",
+    type=click.Choice(["ddim", "plms"], case_sensitive=False),
+    default=None,
+    help="LDM sampler. ddim=faster, plms=better quality. Overrides --quality.",
+)
+@click.option("--crop-margin", default=None, type=int, help="Context pixels around mask (48-200). Overrides --quality.")
+@click.option("--mask-blur", default=None, type=int, help="Mask edge blur radius for feathering (0-20).")
+@click.option(
+    "--edge-blend",
+    default=None,
+    type=int,
+    help="Blend inpainted edges with original (0-20). Smooths seams after inpainting.",
+)
 def remove_cmd(
     input_path: str,
     output_path: str | None,
@@ -69,6 +90,12 @@ def remove_cmd(
     coords: str | None,
     coords_file: str | None,
     coords_percent: str | None,
+    quality: str | None,
+    ldm_steps: int | None,
+    ldm_sampler: str | None,
+    crop_margin: int | None,
+    mask_blur: int | None,
+    edge_blend: int | None,
 ) -> None:
     """Remove watermarks from images or videos."""
     from .core import process
@@ -89,6 +116,12 @@ def remove_cmd(
         coords=coords,
         coords_file=coords_file,
         coords_percent=coords_percent,
+        quality=quality,
+        ldm_steps=ldm_steps,
+        ldm_sampler=ldm_sampler,
+        crop_margin=crop_margin,
+        mask_blur=mask_blur,
+        edge_blend=edge_blend,
     )
 
 

@@ -74,6 +74,26 @@ WATERMARK_PRESETS: dict[str, WatermarkPreset] = {
 }
 
 
+# Quality presets for inpainting
+class QualitySettings(TypedDict):
+    """Settings for a quality preset."""
+
+    ldm_steps: int
+    ldm_sampler: str
+    crop_margin: int
+    mask_blur: int
+    edge_blend: int
+
+
+QUALITY_PRESETS: dict[str, QualitySettings] = {
+    "fast": {"ldm_steps": 25, "ldm_sampler": "ddim", "crop_margin": 48, "mask_blur": 0, "edge_blend": 0},
+    "balanced": {"ldm_steps": 50, "ldm_sampler": "ddim", "crop_margin": 64, "mask_blur": 0, "edge_blend": 0},
+    "high": {"ldm_steps": 100, "ldm_sampler": "plms", "crop_margin": 128, "mask_blur": 4, "edge_blend": 0},
+}
+
+DEFAULT_QUALITY = "balanced"
+
+
 def get_masks_directory() -> Path:
     """Get the path to the masks directory within the package."""
     return Path(__file__).parent / "masks"
@@ -276,17 +296,90 @@ def detect_only(
     return results
 
 
+def apply_mask_feathering(mask: Image.Image, blur_radius: int) -> Image.Image:
+    """Apply Gaussian blur to mask edges for smoother inpainting transitions.
+
+    Args:
+        mask: Grayscale PIL Image (L mode)
+        blur_radius: Blur radius in pixels (0 = no blur)
+
+    Returns:
+        Blurred mask image
+    """
+    if blur_radius <= 0:
+        return mask
+    from PIL import ImageFilter
+
+    return mask.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+
+def apply_edge_blend(
+    original: NDArray[np.uint8],
+    inpainted: NDArray[np.uint8],
+    mask: NDArray[np.uint8],
+    blend_radius: int,
+) -> NDArray[np.uint8]:
+    """Blend inpainted result with original at mask edges for smoother transitions.
+
+    Unlike mask_blur (which weakens inpainting), this blends AFTER inpainting
+    to hide seams while keeping full inpainting strength in the mask center.
+
+    Args:
+        original: Original image as numpy array (RGB)
+        inpainted: Inpainted image as numpy array (RGB)
+        mask: Binary mask (255=inpainted region, 0=original)
+        blend_radius: Blend width in pixels at mask edges (0 = no blend)
+
+    Returns:
+        Blended image as numpy array
+    """
+    if blend_radius <= 0:
+        return inpainted
+
+    from PIL import ImageFilter
+
+    # Create a feathered alpha mask for blending
+    # The mask center stays 255 (fully inpainted), edges fade to 0 (original)
+    mask_pil = Image.fromarray(mask, mode="L")
+    blurred_mask = mask_pil.filter(ImageFilter.GaussianBlur(radius=blend_radius))
+    alpha = np.array(blurred_mask).astype(np.float32) / 255.0
+
+    # Expand alpha to 3 channels for RGB blending
+    alpha_3ch = np.stack([alpha, alpha, alpha], axis=-1)
+
+    # Blend: result = inpainted * alpha + original * (1 - alpha)
+    result = inpainted.astype(np.float32) * alpha_3ch + original.astype(np.float32) * (1 - alpha_3ch)
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
 def process_image_with_lama(
     image: NDArray[np.uint8],
     mask: NDArray[np.uint8],
     model_manager: ModelManager,
+    ldm_steps: int = 50,
+    ldm_sampler: str = "ddim",
+    crop_margin: int = 64,
 ) -> NDArray[np.uint8]:
-    """Apply LaMA inpainting to remove watermarked regions."""
+    """Apply LaMA inpainting to remove watermarked regions.
+
+    Args:
+        image: Input image as numpy array (RGB)
+        mask: Mask array (255=inpaint, 0=keep)
+        model_manager: LaMA model manager
+        ldm_steps: Number of diffusion steps (higher=better quality, slower)
+        ldm_sampler: Sampler type ("ddim" or "plms")
+        crop_margin: Pixels of context around mask region
+
+    Returns:
+        Inpainted image as numpy array
+    """
+    sampler = LDMSampler.plms if ldm_sampler == "plms" else LDMSampler.ddim
+
     config = Config(
-        ldm_steps=50,
-        ldm_sampler=LDMSampler.ddim,
+        ldm_steps=ldm_steps,
+        ldm_sampler=sampler,
         hd_strategy=HDStrategy.CROP,
-        hd_strategy_crop_margin=64,
+        hd_strategy_crop_margin=crop_margin,
         hd_strategy_crop_trigger_size=800,
         hd_strategy_resize_limit=1600,
     )
@@ -573,6 +666,7 @@ def inpaint_image(
     mask: Image.Image,
     model_manager: ModelManager | None,
     transparent: bool,
+    quality_settings: QualitySettings | None = None,
 ) -> Image.Image:
     """Apply watermark removal to an image using mask.
 
@@ -581,6 +675,7 @@ def inpaint_image(
         mask: Mask image (L mode, 255=watermark)
         model_manager: LaMA model (required if transparent=False)
         transparent: If True, make regions transparent; else inpaint
+        quality_settings: Quality parameters for inpainting
 
     Returns:
         Processed PIL Image
@@ -588,8 +683,31 @@ def inpaint_image(
     if transparent:
         return make_region_transparent(image, mask)
 
-    lama_result = process_image_with_lama(np.array(image), np.array(mask), model_manager)
-    return Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
+    # Use defaults if no quality settings provided
+    if quality_settings is None:
+        quality_settings = QUALITY_PRESETS[DEFAULT_QUALITY]
+
+    original_array = np.array(image)
+    mask_array = np.array(mask)
+
+    lama_result = process_image_with_lama(
+        original_array,
+        mask_array,
+        model_manager,
+        ldm_steps=quality_settings["ldm_steps"],
+        ldm_sampler=quality_settings["ldm_sampler"],
+        crop_margin=quality_settings["crop_margin"],
+    )
+
+    # Convert BGR to RGB
+    lama_result_rgb = cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB)
+
+    # Apply edge blending if configured
+    edge_blend = quality_settings.get("edge_blend", 0)
+    if edge_blend > 0:
+        lama_result_rgb = apply_edge_blend(original_array, lama_result_rgb, mask_array, edge_blend)
+
+    return Image.fromarray(lama_result_rgb)
 
 
 def save_image(
@@ -697,6 +815,7 @@ def process_video(
     detection_prompt: str = "watermark",
     progress_offset: int = 0,
     progress_scale: int = 100,
+    quality_settings: QualitySettings | None = None,
 ) -> Path | None:
     """Process a video file by extracting frames, removing watermarks, and reconstructing."""
     input_path = Path(input_path)
@@ -738,6 +857,10 @@ def process_video(
                 pil_image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt
             )
 
+            # Apply mask feathering if configured
+            if quality_settings and quality_settings.get("mask_blur", 0) > 0:
+                mask_image = apply_mask_feathering(mask_image, quality_settings["mask_blur"])
+
             # Process frame
             if transparent:
                 # For video, we can't use transparency, so we'll fill with a color or background
@@ -747,8 +870,26 @@ def process_video(
                 background.paste(result_image, mask=result_image.split()[3])
                 result_image = background
             else:
-                lama_result = process_image_with_lama(np.array(pil_image), np.array(mask_image), model_manager)
-                result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
+                # Use defaults if no quality settings provided
+                qs = quality_settings if quality_settings else QUALITY_PRESETS[DEFAULT_QUALITY]
+                original_array = np.array(pil_image)
+                mask_array = np.array(mask_image)
+                lama_result = process_image_with_lama(
+                    original_array,
+                    mask_array,
+                    model_manager,
+                    ldm_steps=qs["ldm_steps"],
+                    ldm_sampler=qs["ldm_sampler"],
+                    crop_margin=qs["crop_margin"],
+                )
+                lama_result_rgb = cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB)
+
+                # Apply edge blending if configured
+                edge_blend = qs.get("edge_blend", 0)
+                if edge_blend > 0:
+                    lama_result_rgb = apply_edge_blend(original_array, lama_result_rgb, mask_array, edge_blend)
+
+                result_image = Image.fromarray(lama_result_rgb)
 
             # Convert back to OpenCV format and write to output video
             frame_result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
@@ -794,6 +935,7 @@ def process_video_two_pass(
     fade_out_sec: float = 0.0,
     progress_offset: int = 0,
     progress_scale: int = 100,
+    quality_settings: QualitySettings | None = None,
 ) -> Path | None:
     """Two-pass video processing with frame skip detection and fade handling.
 
@@ -907,6 +1049,10 @@ def process_video_two_pass(
                     x1, y1, x2, y2 = bbox
                     draw.rectangle([x1, y1, x2, y2], fill=255)
 
+                # Apply mask feathering if configured
+                if quality_settings and quality_settings.get("mask_blur", 0) > 0:
+                    mask = apply_mask_feathering(mask, quality_settings["mask_blur"])
+
                 # Apply inpainting or transparency
                 if transparent:
                     result_image = make_region_transparent(pil_image, mask)
@@ -914,8 +1060,26 @@ def process_video_two_pass(
                     background.paste(result_image, mask=result_image.split()[3])
                     result_image = background
                 else:
-                    lama_result = process_image_with_lama(np.array(pil_image), np.array(mask), model_manager)
-                    result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
+                    # Use defaults if no quality settings provided
+                    qs = quality_settings if quality_settings else QUALITY_PRESETS[DEFAULT_QUALITY]
+                    original_array = np.array(pil_image)
+                    mask_array = np.array(mask)
+                    lama_result = process_image_with_lama(
+                        original_array,
+                        mask_array,
+                        model_manager,
+                        ldm_steps=qs["ldm_steps"],
+                        ldm_sampler=qs["ldm_sampler"],
+                        crop_margin=qs["crop_margin"],
+                    )
+                    lama_result_rgb = cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB)
+
+                    # Apply edge blending if configured
+                    edge_blend = qs.get("edge_blend", 0)
+                    if edge_blend > 0:
+                        lama_result_rgb = apply_edge_blend(original_array, lama_result_rgb, mask_array, edge_blend)
+
+                    result_image = Image.fromarray(lama_result_rgb)
 
                 frame_result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
             else:
@@ -955,6 +1119,7 @@ def process_video_fixed_coords(
     progress_offset: int = 0,
     progress_scale: int = 100,
     preset_mask: Image.Image | None = None,
+    quality_settings: QualitySettings | None = None,
 ) -> Path | None:
     """Process video with fixed watermark coordinates or preset mask (no AI detection).
 
@@ -974,6 +1139,7 @@ def process_video_fixed_coords(
         progress_offset: Starting progress percentage
         progress_scale: Progress range for this operation
         preset_mask: Pre-loaded mask image (takes precedence over bboxes)
+        quality_settings: Quality parameters for inpainting
 
     Returns:
         Path to output video file, or None on failure
@@ -1091,8 +1257,25 @@ def process_video_fixed_coords(
                     background.paste(result_image, mask=result_image.split()[3])
                     result_image = background
                 else:
-                    lama_result = process_image_with_lama(np.array(pil_image), mask_array, model_manager)
-                    result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
+                    # Use defaults if no quality settings provided
+                    qs = quality_settings if quality_settings else QUALITY_PRESETS[DEFAULT_QUALITY]
+                    original_array = np.array(pil_image)
+                    lama_result = process_image_with_lama(
+                        original_array,
+                        mask_array,
+                        model_manager,
+                        ldm_steps=qs["ldm_steps"],
+                        ldm_sampler=qs["ldm_sampler"],
+                        crop_margin=qs["crop_margin"],
+                    )
+                    lama_result_rgb = cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB)
+
+                    # Apply edge blending if configured
+                    edge_blend = qs.get("edge_blend", 0)
+                    if edge_blend > 0:
+                        lama_result_rgb = apply_edge_blend(original_array, lama_result_rgb, mask_array, edge_blend)
+
+                    result_image = Image.fromarray(lama_result_rgb)
 
                 # Convert back to BGR and write to FFmpeg stdin
                 frame_result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
@@ -1146,8 +1329,25 @@ def process_video_fixed_coords(
                     background.paste(result_image, mask=result_image.split()[3])
                     result_image = background
                 else:
-                    lama_result = process_image_with_lama(np.array(pil_image), mask_array, model_manager)
-                    result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
+                    # Use defaults if no quality settings provided
+                    qs = quality_settings if quality_settings else QUALITY_PRESETS[DEFAULT_QUALITY]
+                    original_array = np.array(pil_image)
+                    lama_result = process_image_with_lama(
+                        original_array,
+                        mask_array,
+                        model_manager,
+                        ldm_steps=qs["ldm_steps"],
+                        ldm_sampler=qs["ldm_sampler"],
+                        crop_margin=qs["crop_margin"],
+                    )
+                    lama_result_rgb = cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB)
+
+                    # Apply edge blending if configured
+                    edge_blend = qs.get("edge_blend", 0)
+                    if edge_blend > 0:
+                        lama_result_rgb = apply_edge_blend(original_array, lama_result_rgb, mask_array, edge_blend)
+
+                    result_image = Image.fromarray(lama_result_rgb)
 
                 frame_result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
                 out.write(frame_result)
@@ -1207,6 +1407,7 @@ def handle_one(
     fade_out: float = 0.0,
     progress_offset: int = 0,
     progress_scale: int = 100,
+    quality_settings: QualitySettings | None = None,
 ) -> Path | None:
     """Process a single image or video file with AI detection."""
     if not check_overwrite_safety(image_path, output_path, overwrite):
@@ -1230,6 +1431,7 @@ def handle_one(
             fade_out,
             progress_offset,
             progress_scale,
+            quality_settings,
         )
 
     return _handle_image_detection(
@@ -1245,6 +1447,7 @@ def handle_one(
         detection_prompt,
         progress_offset,
         progress_scale,
+        quality_settings,
     )
 
 
@@ -1264,6 +1467,7 @@ def _handle_video_detection(
     fade_out: float,
     progress_offset: int,
     progress_scale: int,
+    quality_settings: QualitySettings | None = None,
 ) -> Path | None:
     """Process video with AI watermark detection."""
     use_two_pass = detection_skip > 1 or fade_in > 0 or fade_out > 0
@@ -1282,6 +1486,7 @@ def _handle_video_detection(
         "detection_prompt": detection_prompt,
         "progress_offset": progress_offset,
         "progress_scale": progress_scale,
+        "quality_settings": quality_settings,
     }
 
     if use_two_pass:
@@ -1305,12 +1510,17 @@ def _handle_image_detection(
     detection_prompt: str,
     progress_offset: int,
     progress_scale: int,
+    quality_settings: QualitySettings | None = None,
 ) -> Path | None:
     """Process image with AI watermark detection."""
     image = Image.open(image_path).convert("RGB")
     mask = get_watermark_mask(image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
 
-    result_image = inpaint_image(image, mask, model_manager, transparent)
+    # Apply mask feathering if configured
+    if quality_settings and quality_settings.get("mask_blur", 0) > 0:
+        mask = apply_mask_feathering(mask, quality_settings["mask_blur"])
+
+    result_image = inpaint_image(image, mask, model_manager, transparent, quality_settings)
     output_format = resolve_output_format(image_path, force_format, transparent)
     final_path = save_image(result_image, output_path, output_format)
 
@@ -1372,6 +1582,7 @@ def _process_fixed_coords_single(
     max_bbox_percent: float,
     force_format: str | None,
     overwrite: bool,
+    quality_settings: QualitySettings,
 ) -> Path | None:
     """Process a single file with fixed coordinates or preset mask."""
     width, height = get_media_dimensions(input_path)
@@ -1388,6 +1599,10 @@ def _process_fixed_coords_single(
         logger.info(f"Using {len(bboxes)} watermark region(s): {bboxes}")
         mask = create_mask_from_bboxes(bboxes, width, height)
 
+    # Apply mask feathering if configured
+    if quality_settings["mask_blur"] > 0:
+        mask = apply_mask_feathering(mask, quality_settings["mask_blur"])
+
     output_file = output_path / input_path.name if output_path.is_dir() else output_path
 
     if not check_overwrite_safety(input_path, output_file, overwrite):
@@ -1396,12 +1611,19 @@ def _process_fixed_coords_single(
     if is_video_file(input_path):
         output_file = ensure_video_extension(output_file, force_format)
         return process_video_fixed_coords(
-            input_path, output_file, bboxes, model_manager, transparent, force_format, preset_mask=mask
+            input_path,
+            output_file,
+            bboxes,
+            model_manager,
+            transparent,
+            force_format,
+            preset_mask=mask,
+            quality_settings=quality_settings,
         )
 
     # Process image
     image = Image.open(input_path).convert("RGB")
-    result_image = inpaint_image(image, mask, model_manager, transparent)
+    result_image = inpaint_image(image, mask, model_manager, transparent, quality_settings)
 
     output_format = resolve_output_format(input_path, force_format, transparent)
     output_file = save_image(result_image, output_file, output_format)
@@ -1421,6 +1643,7 @@ def _process_fixed_coords_batch(
     transparent: bool,
     max_bbox_percent: float,
     force_format: str | None,
+    quality_settings: QualitySettings,
 ) -> None:
     """Process multiple files with fixed coordinates or preset mask."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1442,6 +1665,10 @@ def _process_fixed_coords_batch(
         if mask is None:
             mask = create_mask_from_bboxes(bboxes, width, height)
 
+        # Apply mask feathering if configured
+        if quality_settings["mask_blur"] > 0:
+            mask = apply_mask_feathering(mask, quality_settings["mask_blur"])
+
         progress_offset = int(idx / total_files * 100)
         progress_scale = int(100 / total_files)
         output_file = output_dir / file_path.name
@@ -1458,10 +1685,11 @@ def _process_fixed_coords_batch(
                 progress_offset,
                 progress_scale,
                 preset_mask=mask,
+                quality_settings=quality_settings,
             )
         else:
             image = Image.open(file_path).convert("RGB")
-            result_image = inpaint_image(image, mask, model_manager, transparent)
+            result_image = inpaint_image(image, mask, model_manager, transparent, quality_settings)
 
             output_format = resolve_output_format(file_path, force_format, transparent)
             output_file = save_image(result_image, output_file, output_format)
@@ -1481,6 +1709,7 @@ def _process_fixed_coords(
     max_bbox_percent: float,
     force_format: str | None,
     overwrite: bool,
+    quality_settings: QualitySettings,
 ) -> Path | None:
     """Process files with fixed watermark coordinates (no AI detection)."""
     logger.info("Using fixed coordinates mode (no AI detection)")
@@ -1504,6 +1733,7 @@ def _process_fixed_coords(
             transparent,
             max_bbox_percent,
             force_format,
+            quality_settings,
         )
         return None
 
@@ -1519,6 +1749,7 @@ def _process_fixed_coords(
         max_bbox_percent,
         force_format,
         overwrite,
+        quality_settings,
     )
 
 
@@ -1606,6 +1837,7 @@ def _process_detection(
     detection_skip: int,
     fade_in: float,
     fade_out: float,
+    quality_settings: QualitySettings,
 ) -> Path | None:
     """Process files with AI watermark detection."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1649,6 +1881,7 @@ def _process_detection(
                 fade_out,
                 progress_offset,
                 progress_scale,
+                quality_settings,
             )
         return None
 
@@ -1673,6 +1906,7 @@ def _process_detection(
         detection_skip,
         fade_in,
         fade_out,
+        quality_settings=quality_settings,
     )
     print(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")
     return result
@@ -1723,6 +1957,37 @@ def _validate_inputs(
     return detection_skip, fade_in, fade_out, use_fixed_coords
 
 
+def _resolve_quality_settings(
+    quality: str | None,
+    ldm_steps: int | None,
+    ldm_sampler: str | None,
+    crop_margin: int | None,
+    mask_blur: int | None,
+    edge_blend: int | None = None,
+) -> QualitySettings:
+    """Resolve quality settings from preset and/or individual overrides.
+
+    Individual options override preset values.
+    """
+    # Start with preset or default
+    preset_name = quality or DEFAULT_QUALITY
+    settings = QUALITY_PRESETS[preset_name].copy()
+
+    # Apply individual overrides
+    if ldm_steps is not None:
+        settings["ldm_steps"] = max(10, min(200, ldm_steps))
+    if ldm_sampler is not None:
+        settings["ldm_sampler"] = ldm_sampler.lower()
+    if crop_margin is not None:
+        settings["crop_margin"] = max(16, min(512, crop_margin))
+    if mask_blur is not None:
+        settings["mask_blur"] = max(0, min(50, mask_blur))
+    if edge_blend is not None:
+        settings["edge_blend"] = max(0, min(50, edge_blend))
+
+    return settings
+
+
 def process(
     input_path: str,
     output_path: str | None,
@@ -1739,6 +2004,12 @@ def process(
     coords: str | None = None,
     coords_file: str | None = None,
     coords_percent: str | None = None,
+    quality: str | None = None,
+    ldm_steps: int | None = None,
+    ldm_sampler: str | None = None,
+    crop_margin: int | None = None,
+    mask_blur: int | None = None,
+    edge_blend: int | None = None,
 ) -> Path | None:
     """Main processing function - called by CLI.
 
@@ -1757,6 +2028,10 @@ def process(
     input_path_obj = Path(input_path)
     output_path_obj = Path(output_path) if output_path else None
 
+    # Resolve quality settings
+    quality_settings = _resolve_quality_settings(quality, ldm_steps, ldm_sampler, crop_margin, mask_blur, edge_blend)
+    logger.info(f"Quality settings: {quality_settings}")
+
     # Dispatch to appropriate handler
     if use_fixed_coords:
         return _process_fixed_coords(
@@ -1770,6 +2045,7 @@ def process(
             max_bbox_percent,
             force_format,
             overwrite,
+            quality_settings,
         )
 
     if preview:
@@ -1787,4 +2063,5 @@ def process(
         detection_skip,
         fade_in,
         fade_out,
+        quality_settings,
     )
