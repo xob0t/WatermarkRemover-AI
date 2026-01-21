@@ -10,12 +10,11 @@ def main():
 
 
 @main.command()
-@click.option("--china", is_flag=True, help="Use China mirrors (Tsinghua PyPI + HF-Mirror)")
-def setup(china):
-    """Run the setup wizard to install dependencies and download models."""
-    from .setup_wizard import run_setup
+def setup():
+    """Download AI models and configure PyTorch for GPU acceleration."""
+    from .setup import run_setup
 
-    run_setup(china_mode=china)
+    run_setup()
 
 
 @main.command()

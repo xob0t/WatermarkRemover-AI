@@ -24,7 +24,8 @@ dependencies = [
     "psutil",
     "pyyaml",
 
-    # iopaint dependencies (manually specified to avoid iopaint's heavy deps)
+    # iopaint (LaMA inpainting) - deps manually specified below to avoid heavy deps
+    "iopaint",
     "pydantic",
     "typer",
     "einops",
@@ -52,17 +53,10 @@ packages = ["watermark_remover"]
 
 [tool.uv]
 
-# PyTorch CUDA 12.4 index for Windows/Linux with NVIDIA GPU
-[[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
-explicit = true
-
-# Source mappings: Use CUDA on Windows/Linux, default PyPI on macOS
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cu124", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
-]
+# Override iopaint's dependencies to avoid pulling in heavy/conflicting packages
+[[tool.uv.dependency-metadata]]
+name = "iopaint"
+requires-dist = []
 
 # =============================================================================
 # RUFF CONFIGURATION

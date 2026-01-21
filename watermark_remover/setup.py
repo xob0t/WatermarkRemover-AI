@@ -1,6 +1,5 @@
-"""Setup wizard for WatermarkRemover-AI - replaces setup.ps1 and setup.sh."""
+"""Setup script for WatermarkRemover-AI - downloads AI models and configures PyTorch."""
 
-import os
 import shutil
 import subprocess
 import sys
@@ -9,13 +8,13 @@ import time
 import urllib.request
 from pathlib import Path
 
-# China mirror configuration
-CHINA_PYPI_MIRROR = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-CHINA_HF_MIRROR = "https://hf-mirror.com"
-
 # Model URLs
 LAMA_MODEL_URL = "https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt"
 FLORENCE_MODEL_REPO = "florence-community/Florence-2-large"
+
+# PyTorch index URLs
+TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu124"
+TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 
 # Fun facts and tips to show during installation
 TIPS = [
@@ -71,24 +70,7 @@ def detect_platform() -> str:
         return "windows"
     elif sys.platform == "darwin":
         return "macos"
-    else:
-        return "linux"
-
-
-def detect_china_locale() -> bool:
-    """Auto-detect if user is likely in China based on timezone or locale."""
-    try:
-        # Check timezone
-        if time.timezone == -28800 or time.altzone == -28800:  # UTC+8
-            # Could be China, but also Singapore, HK, etc.
-            # Check locale for more confidence
-            import locale
-            lang = locale.getdefaultlocale()[0] or ""
-            if lang.startswith("zh_CN"):
-                return True
-    except Exception:
-        pass
-    return False
+    return "linux"
 
 
 def detect_nvidia_gpu() -> bool:
@@ -109,8 +91,7 @@ def detect_nvidia_gpu() -> bool:
 
 def get_cache_dir() -> Path:
     """Get the torch hub checkpoints directory."""
-    home = Path.home()
-    return home / ".cache" / "torch" / "hub" / "checkpoints"
+    return Path.home() / ".cache" / "torch" / "hub" / "checkpoints"
 
 
 def print_header(text: str):
@@ -123,22 +104,14 @@ def print_header(text: str):
 
 
 def print_ok(text: str):
-    """Print an OK message."""
     print(f"  {Colors.GREEN}[OK]{Colors.RESET} {text}")
 
 
-def print_error(text: str):
-    """Print an error message."""
-    print(f"  {Colors.RED}[X]{Colors.RESET} {text}")
-
-
 def print_warning(text: str):
-    """Print a warning message."""
     print(f"  {Colors.YELLOW}[!]{Colors.RESET} {text}")
 
 
 def print_info(text: str):
-    """Print an info message."""
     print(f"  {Colors.CYAN}[*]{Colors.RESET} {text}")
 
 
@@ -150,38 +123,11 @@ def show_rotating_tips(stop_event: threading.Event, tip_index: list):
         line = f"      {color}{tip['icon']}{Colors.RESET} {tip['text']}"
         print(f"\r{line:<90}", end="", flush=True)
         tip_index[0] += 1
-        for _ in range(50):  # 5 seconds in 100ms increments
+        for _ in range(50):  # 5 seconds
             if stop_event.is_set():
                 break
             time.sleep(0.1)
     print("\r" + " " * 90 + "\r", end="", flush=True)
-
-
-def run_command_with_tips(args: list, env: dict = None, cwd: str = None) -> int:
-    """Run a command while showing rotating tips."""
-    stop_event = threading.Event()
-    tip_index = [0]
-
-    tip_thread = threading.Thread(target=show_rotating_tips, args=(stop_event, tip_index))
-    tip_thread.start()
-
-    try:
-        full_env = os.environ.copy()
-        if env:
-            full_env.update(env)
-
-        process = subprocess.Popen(
-            args,
-            env=full_env,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        process.wait()
-        return process.returncode
-    finally:
-        stop_event.set()
-        tip_thread.join()
 
 
 def download_with_tips(url: str, dest: Path) -> bool:
@@ -212,43 +158,9 @@ def download_with_tips(url: str, dest: Path) -> bool:
     return success[0]
 
 
-def sync_dependencies(china_mode: bool, use_cpu: bool) -> bool:
-    """Sync dependencies using uv."""
-    env = {}
-    if china_mode:
-        env["UV_INDEX_URL"] = CHINA_PYPI_MIRROR
-
-    if use_cpu:
-        env["UV_EXTRA_INDEX_URL"] = "https://download.pytorch.org/whl/cpu"
-
-    args = ["uv", "sync"]
-    return run_command_with_tips(args, env=env) == 0
-
-
-def install_iopaint(china_mode: bool) -> bool:
-    """Install iopaint with --no-deps."""
-    args = ["uv", "pip", "install", "iopaint", "--no-deps"]
-    if china_mode:
-        args.extend(["--index-url", CHINA_PYPI_MIRROR])
-
-    result = subprocess.run(args, capture_output=True)
-    return result.returncode == 0
-
-
-def verify_installation() -> bool:
-    """Verify all required imports work."""
-    result = subprocess.run(
-        ["uv", "run", "python", "-c", "import torch; import transformers; import webview; import cv2; print('OK')"],
-        capture_output=True,
-        text=True,
-    )
-    return "OK" in result.stdout
-
-
 def download_lama_model() -> bool:
     """Download the LaMA inpainting model."""
-    cache_dir = get_cache_dir()
-    lama_file = cache_dir / "big-lama.pt"
+    lama_file = get_cache_dir() / "big-lama.pt"
 
     if lama_file.exists():
         print_ok("LaMA model already exists")
@@ -268,29 +180,37 @@ def download_lama_model() -> bool:
     return False
 
 
-def download_florence_model(china_mode: bool) -> bool:
+def download_florence_model() -> bool:
     """Download the Florence-2 model via huggingface_hub."""
     print()
     print(f"      {Colors.GRAY}Did you know?{Colors.RESET}")
     print()
 
-    env = {}
-    if china_mode:
-        env["HF_ENDPOINT"] = CHINA_HF_MIRROR
-        print(f"      {Colors.GRAY}Using HF-Mirror for faster download in China{Colors.RESET}")
+    stop_event = threading.Event()
+    tip_index = [0]
+    success = [False]
 
-    script = f"""
-import os
-{'os.environ["HF_ENDPOINT"] = "' + CHINA_HF_MIRROR + '"' if china_mode else ''}
-from huggingface_hub import snapshot_download
-snapshot_download('{FLORENCE_MODEL_REPO}', local_dir_use_symlinks=False)
-print('FLORENCE_OK')
-"""
+    def download():
+        try:
+            from huggingface_hub import snapshot_download
 
-    args = ["uv", "run", "python", "-c", script]
-    returncode = run_command_with_tips(args, env=env)
+            snapshot_download(FLORENCE_MODEL_REPO, local_dir_use_symlinks=False)
+            success[0] = True
+        except Exception:
+            success[0] = False
+        finally:
+            stop_event.set()
 
-    if returncode == 0:
+    tip_thread = threading.Thread(target=show_rotating_tips, args=(stop_event, tip_index))
+    download_thread = threading.Thread(target=download)
+
+    tip_thread.start()
+    download_thread.start()
+
+    download_thread.join()
+    tip_thread.join()
+
+    if success[0]:
         print_ok("Florence-2 model ready")
         return True
 
@@ -301,7 +221,7 @@ print('FLORENCE_OK')
 
 def set_console_title(title: str):
     """Set console window title (Windows only)."""
-    if detect_platform() == "windows":
+    if sys.platform == "win32":
         try:
             import ctypes
 
@@ -310,78 +230,71 @@ def set_console_title(title: str):
             pass
 
 
-def run_setup(china_mode: bool = False):
-    """Run the full setup wizard."""
+def install_torch(use_cuda: bool) -> bool:
+    """Install the correct PyTorch version based on GPU availability."""
+    index_url = TORCH_CUDA_INDEX if use_cuda else TORCH_CPU_INDEX
+    variant = "CUDA" if use_cuda else "CPU"
+
+    print_info(f"Installing PyTorch ({variant})...")
+    print()
+
+    try:
+        # Use uv pip to install torch with the correct index
+        result = subprocess.run(
+            ["uv", "pip", "install", "--upgrade", "torch", "--index-url", index_url],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            print_ok(f"PyTorch ({variant}) installed")
+            return True
+        else:
+            print_warning(f"Failed to install PyTorch: {result.stderr}")
+            return False
+    except FileNotFoundError:
+        print_warning("uv not found - please install uv first")
+        return False
+    except Exception as e:
+        print_warning(f"Error installing PyTorch: {e}")
+        return False
+
+
+def run_setup():
+    """Download AI models and configure PyTorch for WatermarkRemover-AI."""
     Colors.init()
     set_console_title("WatermarkRemover-AI Setup")
 
     print_header("WatermarkRemover-AI Setup")
 
+    # Detect platform and GPU
     platform = detect_platform()
-    print_info(f"Detected platform: {platform}")
+    has_nvidia = detect_nvidia_gpu()
 
-    # Auto-detect China locale if not explicitly set
-    if not china_mode:
-        china_mode = detect_china_locale()
+    print_info(f"Platform: {platform}")
 
-    if china_mode:
-        print_ok("Using China mirrors (Tsinghua PyPI + HF-Mirror)")
-    else:
-        print_ok("Using default mirrors")
-    print()
-
-    # Detect GPU
-    use_cpu = False
     if platform == "macos":
-        print_info("macOS detected - using MPS acceleration")
-    elif detect_nvidia_gpu():
-        print_info("NVIDIA GPU detected - using CUDA acceleration")
-    else:
-        print_info("No NVIDIA GPU detected - using CPU version")
-        use_cpu = True
-
-    # Install dependencies
-    print()
-    print_info("Installing dependencies...")
-    print(f"      {Colors.MAGENTA}This may take a few minutes. Chill and learn something!{Colors.RESET}")
-    print()
-    print(f"      {Colors.GRAY}Did you know?{Colors.RESET}")
-    print()
-
-    if not sync_dependencies(china_mode, use_cpu):
+        print_info("Using MPS acceleration (Apple Silicon)")
+        # macOS uses default torch from PyPI (MPS support built-in)
+    elif has_nvidia:
+        print_info("NVIDIA GPU detected - installing CUDA support")
         print()
-        print_error("Failed to install dependencies")
-        sys.exit(1)
+        install_torch(use_cuda=True)
+    else:
+        print_info("No NVIDIA GPU detected - installing CPU version")
+        print()
+        install_torch(use_cuda=False)
 
-    print_ok("Dependencies installed")
-
-    # Install iopaint
-    print_info("Installing iopaint (no deps)...")
-    if not install_iopaint(china_mode):
-        print_error("Failed to install iopaint")
-        sys.exit(1)
-    print_ok("iopaint installed")
-
-    # Verify installation
-    print_info("Verifying installation...")
-    if not verify_installation():
-        print_error("Verification failed")
-        sys.exit(1)
-    print_ok("All dependencies verified")
-
-    # Download models
     print()
     print_info("Downloading LaMA model (~196MB)...")
     download_lama_model()
 
     print()
     print_info("Downloading Florence-2 model (~1.5GB)...")
-    download_florence_model(china_mode)
+    download_florence_model()
 
-    # Success
     print_header("Setup complete! Ready to go!")
 
-    print(f"  To run the app: {Colors.WHITE}uv run watermark-remover gui{Colors.RESET}")
+    print(f"  To run the app: {Colors.WHITE}watermark-remover gui{Colors.RESET}")
     print()
     print(f"  {Colors.MAGENTA}Have fun yeeting watermarks!{Colors.RESET}")
     print()

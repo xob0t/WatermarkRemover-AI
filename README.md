@@ -60,12 +60,7 @@ uv tool install git+https://github.com/D-Ogi/WatermarkRemover-AI.git
 watermark-remover setup
 ```
 
-The setup wizard will automatically:
-
-- Install Python 3.12+ and dependencies
-- Detect GPU (CUDA) or use CPU fallback
-- Download AI models (~1.7GB total)
-- Use China mirrors if zh_CN locale detected (or use `--china` flag)
+The setup command downloads AI models (~1.7GB total). Dependencies are installed automatically by uv.
 
 After setup, launch with `watermark-remover gui`.
 
