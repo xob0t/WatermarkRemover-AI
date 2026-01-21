@@ -1,6 +1,8 @@
-from enum import Enum
+"""Utility functions for WatermarkRemover-AI."""
+
 import random
-import matplotlib.patches as patches
+from enum import Enum
+
 import numpy as np
 from PIL import ImageDraw
 
@@ -12,16 +14,19 @@ colormap = ['blue', 'orange', 'green', 'purple', 'brown', 'pink', 'gray', 'olive
 model = None
 processor = None
 
+
 def set_model_info(model_, processor_):
     global model, processor
     model = model_
     processor = processor_
+
 
 class TaskType(str, Enum):
     """The types of tasks supported"""
     CAPTION = '<CAPTION>'
     DETAILED_CAPTION = '<DETAILED_CAPTION>'
     MORE_DETAILED_CAPTION = '<MORE_DETAILED_CAPTION>'
+
 
 def run_example(task_prompt: TaskType, image, text_input=None):
     """Runs an inference task using the model."""
@@ -46,6 +51,7 @@ def run_example(task_prompt: TaskType, image, text_input=None):
     )
     return parsed_answer
 
+
 def draw_polygons(image, prediction, fill_mask=False):
     """Draws segmentation masks with polygons on an image."""
     draw = ImageDraw.Draw(image)
@@ -65,6 +71,7 @@ def draw_polygons(image, prediction, fill_mask=False):
 
     return image
 
+
 def draw_ocr_bboxes(image, prediction):
     """Draws OCR bounding boxes on an image."""
     draw = ImageDraw.Draw(image)
@@ -76,6 +83,7 @@ def draw_ocr_bboxes(image, prediction):
         draw.text((new_box[0] + 8, new_box[1] + 2), "{}".format(label), align="right", fill=color)
     return image
 
+
 def convert_bbox_to_relative(box, image):
     """Converts bounding box pixel coordinates to relative coordinates in the range 0-999."""
     return [
@@ -85,6 +93,7 @@ def convert_bbox_to_relative(box, image):
         (box[3] / image.height) * 999,
     ]
 
+
 def convert_relative_to_bbox(relative, image):
     """Converts list of relative coordinates to pixel coordinates."""
     return [
@@ -93,6 +102,7 @@ def convert_relative_to_bbox(relative, image):
         (relative[2] / 999) * image.width,
         (relative[3] / 999) * image.height,
     ]
+
 
 def convert_bbox_to_loc(box, image):
     """Converts bounding box pixel coordinates to position tokens."""

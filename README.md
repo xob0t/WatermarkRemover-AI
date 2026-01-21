@@ -20,9 +20,7 @@ It uses Florence-2 from Microsoft for watermark identification and LaMA for inpa
 
 ## Demo
 
-
 https://github.com/user-attachments/assets/505be2a8-8eda-4def-90b6-5a4ceefee456
-
 
 ---
 
@@ -43,34 +41,39 @@ https://github.com/user-attachments/assets/505be2a8-8eda-4def-90b6-5a4ceefee456
 
 ## Installation
 
-### Windows
+### Prerequisites
 
-The setup script downloads a portable Python environment automatically - no system Python required.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (fast Python package manager):
 
-```powershell
-git clone https://github.com/D-Ogi/WatermarkRemover-AI.git
-cd WatermarkRemover-AI
-.\setup.ps1
+```bash
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# Linux / macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-After setup, double-click `run.bat` to launch the app.
-
-### Linux / macOS
-
-Requires Python 3.10+ installed on your system.
+### Setup
 
 ```bash
 git clone https://github.com/D-Ogi/WatermarkRemover-AI.git
 cd WatermarkRemover-AI
-chmod +x setup.sh
-./setup.sh
+./setup.sh      # Linux/macOS
+.\setup.bat     # Windows
 ```
 
-After setup, run `./run.sh` to launch the app.
+The setup wizard will:
+
+- Install Python and dependencies via uv
+- Download AI models (~1.7GB total)
+- Offer to launch the app when complete
+
+After setup, use `run.bat` (Windows) or `./run.sh` (Linux/macOS) to launch.
 
 ### Optional: FFmpeg
 
 Install FFmpeg to preserve audio when processing videos:
+
 - **Windows**: Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH
 - **Linux**: `sudo apt install ffmpeg`
 - **macOS**: `brew install ffmpeg`
@@ -94,31 +97,37 @@ Your settings are automatically saved and restored on next launch.
 
 ```bash
 # Basic usage
-python remwm.py input.png output_folder/
+uv run watermark-remover remove input.png output_folder/
 
 # With options
-python remwm.py ./images ./output --overwrite --max-bbox-percent=15 --force-format=PNG
+uv run watermark-remover remove ./images ./output --overwrite --max-bbox-percent=15 --force-format=PNG
 
 # Process video with two-pass detection
-python remwm.py video.mp4 ./output --detection-skip=3 --fade-in=0.5 --fade-out=0.5
+uv run watermark-remover remove video.mp4 ./output --detection-skip=3 --fade-in=0.5 --fade-out=0.5
 
 # Preview mode (detect without processing)
-python remwm.py input.png --preview
+uv run watermark-remover remove input.png --preview
+
+# Run setup wizard
+uv run watermark-remover setup
+
+# Launch GUI directly
+uv run watermark-remover gui
 ```
 
 ### CLI Options
 
-| Option | Description |
-|--------|-------------|
-| `--overwrite` | Overwrite existing files |
-| `--transparent` | Make watermark regions transparent (images only) |
-| `--max-bbox-percent` | Max detection size as % of image (default: 10) |
-| `--force-format` | Force output format (PNG, WEBP, JPG, MP4, AVI) |
-| `--detection-prompt` | Custom detection prompt (default: "watermark") |
-| `--detection-skip` | Detect every N frames for videos (1-10, default: 1) |
-| `--fade-in` | Extend mask backwards by N seconds (for fade-in watermarks) |
-| `--fade-out` | Extend mask forwards by N seconds (for fade-out watermarks) |
-| `--preview` | Preview detected watermarks without processing |
+| Option               | Description                                                 |
+| -------------------- | ----------------------------------------------------------- |
+| `--overwrite`        | Overwrite existing files                                    |
+| `--transparent`      | Make watermark regions transparent (images only)            |
+| `--max-bbox-percent` | Max detection size as % of image (default: 10)              |
+| `--force-format`     | Force output format (PNG, WEBP, JPG, MP4, AVI)              |
+| `--detection-prompt` | Custom detection prompt (default: "watermark")              |
+| `--detection-skip`   | Detect every N frames for videos (1-10, default: 1)         |
+| `--fade-in`          | Extend mask backwards by N seconds (for fade-in watermarks) |
+| `--fade-out`         | Extend mask forwards by N seconds (for fade-out watermarks) |
+| `--preview`          | Preview detected watermarks without processing              |
 
 ---
 
@@ -154,5 +163,4 @@ Contributions are welcome! Feel free to:
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
 

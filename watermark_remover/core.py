@@ -1,8 +1,17 @@
+"""Core watermark removal functionality."""
+
+import os
+import shutil
+import subprocess
 import sys
-import click
+import tempfile
+from enum import Enum
 from pathlib import Path
+
 import cv2
 import numpy as np
+import tqdm
+from loguru import logger
 from PIL import Image, ImageDraw
 
 # Monkey-patch: cached_download was removed in huggingface_hub 0.24, add compatibility shim
@@ -10,18 +19,10 @@ import huggingface_hub
 if not hasattr(huggingface_hub, 'cached_download'):
     huggingface_hub.cached_download = huggingface_hub.hf_hub_download
 
-from transformers import AutoProcessor, Florence2ForConditionalGeneration
-from iopaint.model_manager import ModelManager
-from iopaint.schema import HDStrategy, LDMSampler, InpaintRequest as Config
 import torch
-from torch.nn import Module
-import tqdm
-from loguru import logger
-from enum import Enum
-import os
-import tempfile
-import shutil
-import subprocess
+from iopaint.model_manager import ModelManager
+from iopaint.schema import HDStrategy, InpaintRequest as Config, LDMSampler
+from transformers import AutoProcessor, Florence2ForConditionalGeneration
 
 try:
     from cv2.typing import MatLike
@@ -64,12 +65,14 @@ def load_lama_model(device):
                 # Try again
                 return ModelManager(name="lama", device=device)
             else:
-                raise RuntimeError("Failed to download LaMA model. Please run manually: python\\python.exe -m iopaint download --model lama")
+                raise RuntimeError("Failed to download LaMA model. Please run manually: python -m iopaint download --model lama")
         raise
+
 
 class TaskType(str, Enum):
     OPEN_VOCAB_DETECTION = "<OPEN_VOCABULARY_DETECTION>"
     """Detect bounding box for objects and OCR text"""
+
 
 def identify(task_prompt: TaskType, image: MatLike, text_input: str, model: Florence2ForConditionalGeneration, processor: AutoProcessor, device: str):
     if not isinstance(task_prompt, TaskType):
@@ -90,6 +93,7 @@ def identify(task_prompt: TaskType, image: MatLike, text_input: str, model: Flor
     return processor.post_process_generation(
         generated_text, task=task_prompt.value, image_size=(image.width, image.height)
     )
+
 
 def get_watermark_mask(image: MatLike, model: Florence2ForConditionalGeneration, processor: AutoProcessor, device: str, max_bbox_percent: float, detection_prompt: str = "watermark"):
     """
@@ -153,6 +157,7 @@ def detect_only(image: MatLike, model: Florence2ForConditionalGeneration, proces
 
     return results
 
+
 def process_image_with_lama(image: MatLike, mask: MatLike, model_manager: ModelManager):
     config = Config(
         ldm_steps=50,
@@ -169,6 +174,7 @@ def process_image_with_lama(image: MatLike, mask: MatLike, model_manager: ModelM
 
     return result
 
+
 def make_region_transparent(image: Image.Image, mask: Image.Image):
     image = image.convert("RGBA")
     mask = mask.convert("L")
@@ -181,10 +187,12 @@ def make_region_transparent(image: Image.Image, mask: Image.Image):
                 transparent_image.putpixel((x, y), image.getpixel((x, y)))
     return transparent_image
 
+
 def is_video_file(file_path):
     """Check if the file is a video based on its extension"""
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm']
     return Path(file_path).suffix.lower() in video_extensions
+
 
 def process_video(input_path, output_path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, detection_prompt="watermark", progress_offset=0, progress_scale=100):
     """Process a video file by extracting frames, removing watermarks, and reconstructing the video"""
@@ -198,24 +206,24 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
+
     # Determine output format
     if force_format:
         output_format = force_format.upper()
     else:
         output_format = "MP4"  # Default to MP4 for videos
-    
+
     # Create output video file
     output_path = Path(output_path)
     if output_path.is_dir():
         output_file = output_path / f"{input_path.stem}_no_watermark.{output_format.lower()}"
     else:
         output_file = output_path.with_suffix(f".{output_format.lower()}")
-    
+
     # Create a temporary file for the video without audio
     temp_dir = tempfile.mkdtemp()
     temp_video_path = Path(temp_dir) / f"temp_no_audio.{output_format.lower()}"
-    
+
     # Set codec based on output format
     if output_format.upper() == "MP4":
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -223,9 +231,9 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
         fourcc = cv2.VideoWriter_fourcc(*'XVID')
     else:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Default to MP4
-    
+
     out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, (width, height))
-    
+
     # Process each frame
     with tqdm.tqdm(total=total_frames, desc="Processing video frames") as pbar:
         frame_count = 0
@@ -233,14 +241,14 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
             ret, frame = cap.read()
             if not ret:
                 break
-            
+
             # Convert frame to PIL Image
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(frame_rgb)
-            
+
             # Get watermark mask
             mask_image = get_watermark_mask(pil_image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
-            
+
             # Process frame
             if transparent:
                 # For video, we can't use transparency, so we'll fill with a color or background
@@ -252,26 +260,26 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
             else:
                 lama_result = process_image_with_lama(np.array(pil_image), np.array(mask_image), model_manager)
                 result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
-            
+
             # Convert back to OpenCV format and write to output video
             frame_result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
             out.write(frame_result)
-            
+
             # Update progress
             frame_count += 1
             pbar.update(1)
             local_progress = frame_count / total_frames
             progress = int(progress_offset + local_progress * progress_scale)
             print(f"Processing frame {frame_count}/{total_frames}, overall_progress:{progress}%")
-    
+
     # Release resources
     cap.release()
     out.release()
-    
+
     # Combine processed video with original audio using FFmpeg
     try:
         logger.info("Merging processed video with original audio...")
-        
+
         # Check if FFmpeg is available
         try:
             subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT)
@@ -306,7 +314,7 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
             os.rmdir(temp_dir)
         except:
             pass
-    
+
     final_progress = progress_offset + progress_scale
     logger.info(f"input_path:{input_path}, output_path:{output_file}, overall_progress:{final_progress}")
     return output_file
@@ -539,7 +547,7 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
         output_format = image_path.suffix[1:].upper()
         if output_format not in ["PNG", "WEBP", "JPG"]:
             output_format = "PNG"
-    
+
     # Map JPG to JPEG for PIL compatibility
     if output_format == "JPG":
         output_format = "JPEG"
@@ -555,19 +563,9 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
     print(f"input_path:{image_path}, output_path:{new_output_path}, overall_progress:{final_progress}%")
     return new_output_path
 
-@click.command()
-@click.argument("input_path", type=click.Path(exists=True))
-@click.argument("output_path", type=click.Path(), required=False, default=None)
-@click.option("--preview", is_flag=True, help="Preview mode: detect watermarks and output JSON with base64 image (no processing).")
-@click.option("--overwrite", is_flag=True, help="Overwrite existing files in bulk mode.")
-@click.option("--transparent", is_flag=True, help="Make watermark regions transparent instead of removing.")
-@click.option("--max-bbox-percent", default=10.0, help="Maximum percentage of the image that a bounding box can cover.")
-@click.option("--force-format", type=click.Choice(["PNG", "WEBP", "JPG", "MP4", "AVI"], case_sensitive=False), default=None, help="Force output format. Defaults to input format.")
-@click.option("--detection-prompt", default="watermark", help="Text prompt for watermark detection (e.g. 'watermark', 'watermark Sora logo', 'Getty Images').")
-@click.option("--detection-skip", default=1, type=int, help="Detect watermarks every N frames for videos (1-10). Higher = faster but may miss brief watermarks.")
-@click.option("--fade-in", default=0.0, type=float, help="Extend mask backwards by N seconds to handle fade-in watermarks.")
-@click.option("--fade-out", default=0.0, type=float, help="Extend mask forwards by N seconds to handle fade-out watermarks.")
-def main(input_path: str, output_path: str, preview: bool, overwrite: bool, transparent: bool, max_bbox_percent: float, force_format: str, detection_prompt: str, detection_skip: int, fade_in: float, fade_out: float):
+
+def process(input_path: str, output_path: str, preview: bool = False, overwrite: bool = False, transparent: bool = False, max_bbox_percent: float = 10.0, force_format: str = None, detection_prompt: str = "watermark", detection_skip: int = 1, fade_in: float = 0.0, fade_out: float = 0.0):
+    """Main processing function - called by CLI."""
     # Input validation
     if detection_skip < 1 or detection_skip > 10:
         logger.warning(f"detection_skip must be 1-10, got {detection_skip}. Using 1.")
@@ -581,10 +579,10 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
 
     # ========== PREVIEW MODE ==========
     if preview:
-        import json
         import base64
-        from io import BytesIO
+        import json
         import random
+        from io import BytesIO
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         florence_model = Florence2ForConditionalGeneration.from_pretrained("florence-community/Florence-2-large").to(device).eval()
@@ -700,6 +698,3 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
 
         handle_one(input_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt, detection_skip, fade_in, fade_out)
         print(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")
-
-if __name__ == "__main__":
-    main()

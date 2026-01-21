@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 cd "$(dirname "$0")"
-uv run python remwmgui.py
+uv run watermark-remover gui

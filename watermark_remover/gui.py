@@ -1,9 +1,17 @@
 """
-WatermarkRemover-AI GUI - Ohio Edition
-PyWebview frontend with brainrot HTML UI
+WatermarkRemover-AI GUI
+PyWebview frontend with HTML UI
 """
 
+import json
 import logging
+import os
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+import yaml
 
 # Suppress noisy pywebview WebView2 COM warnings (thread safety noise, doesn't affect functionality)
 class PyWebviewFilter(logging.Filter):
@@ -16,17 +24,10 @@ class PyWebviewFilter(logging.Filter):
             return False
         return True
 
+
 logging.getLogger('pywebview').addFilter(PyWebviewFilter())
 
 import webview
-import threading
-import subprocess
-import sys
-import os
-import json
-import yaml
-import base64
-from pathlib import Path
 
 # Only psutil for system info (lightweight)
 try:
@@ -36,7 +37,11 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.yml")
+# Get the project root directory (parent of watermark_remover package)
+PACKAGE_DIR = Path(__file__).parent
+PROJECT_ROOT = PACKAGE_DIR.parent
+CONFIG_FILE = PROJECT_ROOT / "ui.yml"
+UI_PATH = PROJECT_ROOT / "ui" / "index.html"
 
 
 class Api:
@@ -47,8 +52,8 @@ class Api:
         self.process = None
         self.is_running = False
         print(f"[DEBUG] CONFIG_FILE path: {CONFIG_FILE}")
-        print(f"[DEBUG] File exists: {os.path.exists(CONFIG_FILE)}")
-        if os.path.exists(CONFIG_FILE):
+        print(f"[DEBUG] File exists: {CONFIG_FILE.exists()}")
+        if CONFIG_FILE.exists():
             with open(CONFIG_FILE, 'r') as f:
                 print(f"[DEBUG] Raw file contents:\n{f.read()}")
         self.config = self._load_config()
@@ -60,7 +65,7 @@ class Api:
 
     def _load_config(self):
         """Load saved configuration from YAML file"""
-        if os.path.exists(CONFIG_FILE):
+        if CONFIG_FILE.exists():
             try:
                 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                     return yaml.safe_load(f) or {}
@@ -282,8 +287,8 @@ class Api:
             'lang': settings.get('lang', 'brainrot')
         })
 
-        # Build command
-        cmd = [sys.executable, 'remwm.py', input_path, output_path]
+        # Build command - use the CLI entry point
+        cmd = [sys.executable, '-m', 'watermark_remover.cli', 'remove', input_path, output_path]
 
         if settings.get('overwrite'):
             cmd.append('--overwrite')
@@ -319,22 +324,13 @@ class Api:
         """Run the subprocess and stream output to frontend"""
         try:
             # Log the CLI command for educational purposes
-            cli_display = ' '.join(cmd[1:])  # Skip python executable
-            cli_display = cli_display.replace('remwm.py ', 'python remwm.py \\\n    ')
+            cli_display = ' '.join(cmd[2:])  # Skip python -m
+            cli_display = cli_display.replace('watermark_remover.cli remove ', 'watermark-remover remove \\\n    ')
             cli_display = cli_display.replace(' --', ' \\\n    --')
             self._call_js(f'addLog("$ {json.dumps(cli_display)[1:-1]}", "text-neon-cyan")')
 
             env = os.environ.copy()
             env['PYTHONUNBUFFERED'] = '1'
-
-            working_dir = os.path.dirname(os.path.abspath(__file__))
-            script_path = os.path.join(working_dir, 'remwm.py')
-
-            # Verify script exists
-            if not os.path.exists(script_path):
-                self._call_js(f'addLog("ERROR: remwm.py not found at {json.dumps(script_path)}", "text-error")')
-                self._call_js('processingComplete()')
-                return
 
             self.process = subprocess.Popen(
                 cmd,
@@ -343,7 +339,7 @@ class Api:
                 text=True,
                 bufsize=1,
                 env=env,
-                cwd=working_dir
+                cwd=str(PROJECT_ROOT)
             )
 
             for line in iter(self.process.stdout.readline, ''):
@@ -432,7 +428,7 @@ class Api:
         try:
             # Call CLI with --preview flag
             cmd = [
-                sys.executable, 'remwm.py',
+                sys.executable, '-m', 'watermark_remover.cli', 'remove',
                 input_path, '--preview',
                 '--max-bbox-percent', str(int(max_bbox)),
                 '--detection-prompt', detection_prompt
@@ -443,7 +439,7 @@ class Api:
                 capture_output=True,
                 text=True,
                 timeout=120,
-                cwd=os.path.dirname(os.path.abspath(__file__))
+                cwd=str(PROJECT_ROOT)
             )
 
             if result.returncode != 0:
@@ -468,12 +464,9 @@ def main():
     """Main entry point"""
     api = Api()
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    ui_path = os.path.join(script_dir, 'ui', 'index.html')
-
     window = webview.create_window(
-        'WatermarkRemover AI - Ohio Edition',
-        ui_path,
+        'WatermarkRemover AI',
+        str(UI_PATH),
         js_api=api,
         width=950,
         height=860,
