@@ -1,14 +1,11 @@
-# WatermarkRemover-AI Setup Script
+# WatermarkRemover-AI Setup Script (uv)
 $Host.UI.RawUI.WindowTitle = "WatermarkRemover-AI Setup"
 
-$PYTHON_VERSION = "3.12.7"
-$PYTHON_DIR = "python"
-$PYTHON_EXE = "$PYTHON_DIR\python.exe"
+$PYTHON_VERSION = "3.12"
 
 # China mirror configuration
 $CHINA_MODE = $false
-$PIP_INDEX_URL = ""
-$PIP_EXTRA_ARGS = @()
+$UV_INDEX_URL = ""
 $HF_ENDPOINT = ""
 
 # Fun facts and tips to show during installation
@@ -45,8 +42,7 @@ Write-Host "      This will use faster mirrors for downloads" -ForegroundColor D
 $chinaChoice = Read-Host "      "
 if ($chinaChoice -eq "y" -or $chinaChoice -eq "Y") {
     $CHINA_MODE = $true
-    $PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
-    $PIP_EXTRA_ARGS = @("-i", $PIP_INDEX_URL, "--trusted-host", "pypi.tuna.tsinghua.edu.cn")
+    $UV_INDEX_URL = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
     $HF_ENDPOINT = "https://hf-mirror.com"
     Write-Host "  [OK] Using China mirrors (Tsinghua PyPI + HF-Mirror)" -ForegroundColor Green
 } else {
@@ -54,78 +50,75 @@ if ($chinaChoice -eq "y" -or $chinaChoice -eq "Y") {
 }
 Write-Host ""
 
-# Check if embedded Python exists
-if (-not (Test-Path $PYTHON_EXE)) {
-    Write-Host "  [*] Downloading Python $PYTHON_VERSION..." -ForegroundColor Cyan
-
-    $arch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "win32" }
-    $pythonZip = "python-$PYTHON_VERSION-embed-$arch.zip"
-    $pythonUrl = "https://www.python.org/ftp/python/$PYTHON_VERSION/$pythonZip"
-
+# Check if uv is installed
+$uvCmd = Get-Command uv -ErrorAction SilentlyContinue
+if (-not $uvCmd) {
+    Write-Host "  [*] Installing uv package manager..." -ForegroundColor Cyan
     try {
-        # Download Python
-        Invoke-WebRequest -Uri $pythonUrl -OutFile $pythonZip -UseBasicParsing
-        Write-Host "  [OK] Downloaded Python" -ForegroundColor Green
+        Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
 
-        # Extract
-        Write-Host "  [*] Extracting..." -ForegroundColor Cyan
-        Expand-Archive -Path $pythonZip -DestinationPath $PYTHON_DIR -Force
-        Remove-Item $pythonZip
+        # Refresh PATH for current session
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
 
-        # Enable pip by modifying python312._pth
-        $pthFile = Join-Path $PYTHON_DIR "python312._pth"
-        if (Test-Path $pthFile) {
-            $pthContent = Get-Content $pthFile -Raw
-            $pthContent = $pthContent -replace "#import site", "import site"
-            $pthContent = $pthContent + "`nLib\site-packages"
-            Set-Content -Path $pthFile -Value $pthContent -NoNewline
+        # Also check common install location
+        $uvUserPath = "$env:USERPROFILE\.local\bin"
+        if (Test-Path "$uvUserPath\uv.exe") {
+            $env:Path = "$uvUserPath;$env:Path"
+        }
+        $uvCargoPath = "$env:USERPROFILE\.cargo\bin"
+        if (Test-Path "$uvCargoPath\uv.exe") {
+            $env:Path = "$uvCargoPath;$env:Path"
         }
 
-        # Create Lib\site-packages directory
-        $sitePackages = Join-Path $PYTHON_DIR "Lib\site-packages"
-        New-Item -ItemType Directory -Path $sitePackages -Force | Out-Null
+        # Verify installation
+        $uvCmd = Get-Command uv -ErrorAction SilentlyContinue
+        if (-not $uvCmd) {
+            throw "uv not found in PATH after installation"
+        }
 
-        # Download and install pip
-        Write-Host "  [*] Installing pip..." -ForegroundColor Cyan
-        $getPipUrl = "https://bootstrap.pypa.io/get-pip.py"
-        Invoke-WebRequest -Uri $getPipUrl -OutFile "get-pip.py" -UseBasicParsing
-        & $PYTHON_EXE get-pip.py --no-warn-script-location 2>&1 | Out-Null
-        Remove-Item "get-pip.py"
-
-        Write-Host "  [OK] Python $PYTHON_VERSION ready" -ForegroundColor Green
+        Write-Host "  [OK] uv installed" -ForegroundColor Green
     }
     catch {
-        Write-Host "  [X] Failed to download Python: $_" -ForegroundColor Red
+        Write-Host "  [X] Failed to install uv: $_" -ForegroundColor Red
+        Write-Host "      Please install uv manually: https://docs.astral.sh/uv/getting-started/installation/" -ForegroundColor Yellow
+        Read-Host "  Press Enter to exit"
+        exit 1
+    }
+} else {
+    Write-Host "  [OK] uv found" -ForegroundColor Green
+}
+
+# Install Python using uv
+Write-Host "  [*] Checking Python $PYTHON_VERSION..." -ForegroundColor Cyan
+$pythonCheck = & uv python find $PYTHON_VERSION 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  [*] Installing Python $PYTHON_VERSION via uv..." -ForegroundColor Cyan
+    & uv python install $PYTHON_VERSION
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  [X] Failed to install Python" -ForegroundColor Red
         Read-Host "  Press Enter to exit"
         exit 1
     }
 }
-else {
-    Write-Host "  [OK] Python found" -ForegroundColor Green
-}
+Write-Host "  [OK] Python $PYTHON_VERSION ready" -ForegroundColor Green
 
 Write-Host ""
 Write-Host "  [*] Installing dependencies..." -ForegroundColor Cyan
-Write-Host "      This takes 5-10 minutes. Chill and learn something!" -ForegroundColor Magenta
+Write-Host "      This may take a few minutes. Chill and learn something!" -ForegroundColor Magenta
 Write-Host ""
 Write-Host "      Did you know?" -ForegroundColor DarkGray
 Write-Host ""
 
-# Upgrade pip and ensure build tooling is available for sdists
+# Build uv sync arguments
+$syncArgs = @("sync", "--python", $PYTHON_VERSION)
 if ($CHINA_MODE) {
-    & $PYTHON_EXE -m pip install --upgrade pip setuptools wheel -i $PIP_INDEX_URL --trusted-host pypi.tuna.tsinghua.edu.cn 2>&1 | Out-Null
-} else {
-    & $PYTHON_EXE -m pip install --upgrade pip setuptools wheel 2>&1 | Out-Null
+    $env:UV_INDEX_URL = $UV_INDEX_URL
 }
 
-# Install base deps with tips (legacy resolver to ignore conflicts)
-if ($CHINA_MODE) {
-    # For China: use Tsinghua mirror, skip PyTorch extra-index-url from requirements.txt
-    $process = Start-Process -FilePath $PYTHON_EXE -ArgumentList "-m", "pip", "install", "--upgrade", "-r", "requirements.txt", "--no-cache-dir", "--use-deprecated=legacy-resolver", "-i", $PIP_INDEX_URL, "--trusted-host", "pypi.tuna.tsinghua.edu.cn" -NoNewWindow -PassThru
-} else {
-    $process = Start-Process -FilePath $PYTHON_EXE -ArgumentList "-m", "pip", "install", "--upgrade", "-r", "requirements.txt", "--no-cache-dir", "--use-deprecated=legacy-resolver" -NoNewWindow -PassThru
-}
+# Start the sync process
+$process = Start-Process -FilePath "uv" -ArgumentList $syncArgs -NoNewWindow -PassThru
 
+# Show tips while installing
 $lastTipTime = Get-Date
 $currentTip = Get-Random -Maximum $tips.Count
 
@@ -145,27 +138,24 @@ while (-not $process.HasExited) {
 
 Write-Host "`r                                                                                              "
 
-# Legacy resolver can return non-zero even on success, so verify key packages
-$verifyResult = & $PYTHON_EXE -c "import torch; import transformers; import webview; import cv2; print('OK')" 2>&1
-if ($verifyResult -ne "OK") {
-    if ($process.ExitCode -ne 0) {
-        Write-Host ""
-        Write-Host "  [X] Failed to install dependencies" -ForegroundColor Red
-        Read-Host "  Press Enter to exit"
-        exit 1
-    }
+if ($process.ExitCode -ne 0) {
+    Write-Host ""
+    Write-Host "  [X] Failed to install dependencies" -ForegroundColor Red
+    Read-Host "  Press Enter to exit"
+    exit 1
 }
 
-# Install iopaint separately without pulling its deps (we already have ours)
+Write-Host "  [OK] Dependencies installed" -ForegroundColor Green
+
+# Install iopaint separately with --no-deps
 Write-Host "  [*] Installing iopaint (no deps)..." -ForegroundColor Cyan
 if ($CHINA_MODE) {
-    $iopaintProcess = Start-Process -FilePath $PYTHON_EXE -ArgumentList "-m", "pip", "install", "--upgrade", "iopaint", "--no-deps", "--no-cache-dir", "-i", $PIP_INDEX_URL, "--trusted-host", "pypi.tuna.tsinghua.edu.cn" -NoNewWindow -PassThru
+    & uv pip install iopaint --no-deps --index-url $UV_INDEX_URL 2>&1 | Out-Null
 } else {
-    $iopaintProcess = Start-Process -FilePath $PYTHON_EXE -ArgumentList "-m", "pip", "install", "--upgrade", "iopaint", "--no-deps", "--no-cache-dir" -NoNewWindow -PassThru
+    & uv pip install iopaint --no-deps 2>&1 | Out-Null
 }
-$iopaintProcess.WaitForExit()
 
-if ($iopaintProcess.ExitCode -ne 0) {
+if ($LASTEXITCODE -ne 0) {
     Write-Host ""
     Write-Host "  [X] Failed to install iopaint" -ForegroundColor Red
     Read-Host "  Press Enter to exit"
@@ -173,53 +163,18 @@ if ($iopaintProcess.ExitCode -ne 0) {
 }
 Write-Host "  [OK] iopaint installed" -ForegroundColor Green
 
-# Install iopaint's required dependencies manually (subset needed for LaMA inpainting)
-Write-Host "  [*] Installing iopaint dependencies..." -ForegroundColor Cyan
-if ($CHINA_MODE) {
-    $iopaintDepsProcess = Start-Process -FilePath $PYTHON_EXE -ArgumentList "-m", "pip", "install", "pydantic", "typer", "einops", "omegaconf", "easydict", "yacs", "--no-cache-dir", "-i", $PIP_INDEX_URL, "--trusted-host", "pypi.tuna.tsinghua.edu.cn" -NoNewWindow -PassThru
-} else {
-    $iopaintDepsProcess = Start-Process -FilePath $PYTHON_EXE -ArgumentList "-m", "pip", "install", "pydantic", "typer", "einops", "omegaconf", "easydict", "yacs", "--no-cache-dir" -NoNewWindow -PassThru
-}
-$iopaintDepsProcess.WaitForExit()
-
-if ($iopaintDepsProcess.ExitCode -ne 0) {
-    Write-Host ""
-    Write-Host "  [X] Failed to install iopaint dependencies" -ForegroundColor Red
+# Verify installation
+Write-Host "  [*] Verifying installation..." -ForegroundColor Cyan
+$verifyResult = & uv run python -c "import torch; import transformers; import webview; import cv2; print('OK')" 2>&1
+if ($verifyResult -notmatch "OK") {
+    Write-Host "  [X] Verification failed" -ForegroundColor Red
+    Write-Host "      $verifyResult" -ForegroundColor Yellow
     Read-Host "  Press Enter to exit"
     exit 1
 }
+Write-Host "  [OK] All dependencies verified" -ForegroundColor Green
 
-# Verify iopaint dependencies are properly installed
-Write-Host "  [*] Verifying iopaint dependencies..." -ForegroundColor Cyan
-$verifyIopaint = & $PYTHON_EXE -c "import pydantic; import typer; import einops; import omegaconf; import easydict; import yacs; print('OK')" 2>&1
-if ($verifyIopaint -ne "OK") {
-    Write-Host ""
-    Write-Host "  [X] iopaint dependencies verification failed" -ForegroundColor Red
-    Write-Host "      Missing modules detected. Attempting reinstall..." -ForegroundColor Yellow
-
-    # Try installing one by one to identify issues
-    $deps = @("pydantic", "typer", "einops", "omegaconf", "easydict", "yacs")
-    foreach ($dep in $deps) {
-        if ($CHINA_MODE) {
-            & $PYTHON_EXE -m pip install $dep --no-cache-dir -i $PIP_INDEX_URL --trusted-host pypi.tuna.tsinghua.edu.cn 2>&1 | Out-Null
-        } else {
-            & $PYTHON_EXE -m pip install $dep --no-cache-dir 2>&1 | Out-Null
-        }
-    }
-
-    # Verify again
-    $verifyAgain = & $PYTHON_EXE -c "import pydantic; import typer; import einops; import omegaconf; import easydict; import yacs; print('OK')" 2>&1
-    if ($verifyAgain -ne "OK") {
-        Write-Host "  [X] Could not install iopaint dependencies" -ForegroundColor Red
-        Write-Host "      Please try running: pip install pydantic typer einops omegaconf easydict yacs" -ForegroundColor Yellow
-        Read-Host "  Press Enter to exit"
-        exit 1
-    }
-}
-
-Write-Host "  [OK] Dependencies installed and verified" -ForegroundColor Green
-
-# Download LaMA model directly from GitHub (avoids iopaint CLI dependency on fastapi)
+# Download LaMA model
 Write-Host ""
 Write-Host "  [*] Downloading AI model (196MB)..." -ForegroundColor Cyan
 Write-Host ""
@@ -231,13 +186,11 @@ $lamaFile = Join-Path $lamaDir "big-lama.pt"
 $lamaUrl = "https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt"
 
 if (-not (Test-Path $lamaFile)) {
-    # Create directory if needed
     if (-not (Test-Path $lamaDir)) {
         New-Item -ItemType Directory -Path $lamaDir -Force | Out-Null
     }
 
     try {
-        # Show tips while downloading
         $job = Start-Job -ScriptBlock {
             param($url, $dest)
             Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
@@ -260,7 +213,7 @@ if (-not (Test-Path $lamaFile)) {
 
         Write-Host "`r                                                                                              "
 
-        $result = Receive-Job -Job $job
+        Receive-Job -Job $job | Out-Null
         Remove-Job -Job $job
 
         if (Test-Path $lamaFile) {
@@ -279,7 +232,7 @@ else {
     Write-Host "  [OK] LaMA model already exists" -ForegroundColor Green
 }
 
-# Download Florence-2 model for watermark detection
+# Download Florence-2 model
 Write-Host ""
 Write-Host "  [*] Downloading Florence-2 detection model (~1.5GB)..." -ForegroundColor Cyan
 Write-Host ""
@@ -287,7 +240,6 @@ Write-Host "      Did you know?" -ForegroundColor DarkGray
 Write-Host ""
 
 if ($CHINA_MODE) {
-    # Set HF_ENDPOINT environment variable for China mirror
     $env:HF_ENDPOINT = $HF_ENDPOINT
     Write-Host "      Using HF-Mirror for faster download in China" -ForegroundColor DarkGray
     $florenceScript = @"
@@ -305,7 +257,7 @@ print('FLORENCE_OK')
 "@
 }
 
-$florenceProcess = Start-Process -FilePath $PYTHON_EXE -ArgumentList "-c", "`"$florenceScript`"" -NoNewWindow -PassThru
+$florenceProcess = Start-Process -FilePath "uv" -ArgumentList "run", "python", "-c", "`"$florenceScript`"" -NoNewWindow -PassThru
 
 $lastTipTime = Get-Date
 while (-not $florenceProcess.HasExited) {
@@ -345,7 +297,7 @@ $launch = Read-Host "  Launch now? (y/n)"
 if ($launch -eq "y" -or $launch -eq "Y") {
     Write-Host ""
     Write-Host "  Starting WatermarkRemover-AI..." -ForegroundColor Green
-    Start-Process -FilePath $PYTHON_EXE -ArgumentList "remwmgui.py" -NoNewWindow
+    & uv run python remwmgui.py
 }
 
 Write-Host ""
