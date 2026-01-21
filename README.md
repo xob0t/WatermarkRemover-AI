@@ -45,14 +45,17 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-### Setup
+### Install
 
 ```bash
+# CPU (default)
 uv tool install git+https://github.com/D-Ogi/WatermarkRemover-AI.git
-watermark-remover setup
+
+# With CUDA (NVIDIA GPU)
+uv tool install "watermarkremover-ai[cuda] @ git+https://github.com/D-Ogi/WatermarkRemover-AI.git"
 ```
 
-The setup command downloads AI models (~1.7GB total). Dependencies are installed automatically by uv.
+AI models (~1.7GB total) are downloaded automatically on first use.
 
 ### Optional: FFmpeg
 
@@ -78,9 +81,6 @@ watermark-remover remove video.mp4 ./output --detection-skip=3 --fade-in=0.5 --f
 
 # Preview mode (detect without processing)
 watermark-remover remove input.png --preview
-
-# Run setup wizard
-watermark-remover setup
 ```
 
 ### Options
